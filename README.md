@@ -68,6 +68,7 @@ pip install flashinfer-python -i https://flashinfer.ai/whl/cu128/torch2.9/
 
 > For other CUDA/PyTorch combinations, see [FlashInfer installation](https://docs.flashinfer.ai/installation.html).
 > If FlashInfer is not installed, the model falls back to SDPA (PyTorch native attention) via `--use_sdpa`.
+> In that case, append `--use_sdpa` to the demo commands below.
 
 **5. Visualization dependencies (optional)**
 
@@ -89,9 +90,22 @@ pip install -e ".[vis]"
 
 Run `demo.py` for interactive 3D visualization via a browser-based [viser](https://github.com/nerfstudio-project/viser) viewer (default `http://localhost:8080`).
 
+### Quick Smoke Test
+
+For a short end-to-end check before running a full scene:
+
+```bash
+python demo.py --model_path /path/to/lingbot-map.pt \
+    --image_folder example/church --first_k 4 \
+    --camera_num_iterations 1 --use_sdpa
+```
+
 ### Try the Example Scenes
 
 We provide four example scenes in `example/` that you can run out of the box:
+
+If FlashInfer is not installed, append `--use_sdpa` to each command below.
+
 ```bash
 # Church scene
 python demo.py --model_path /path/to/lingbot-map-long.pt \

@@ -11,3 +11,5 @@ CLAUDE.md
 .claude/
 .agents/
 skyseg.onnx
+checkpoints/
+*_sky_masks/

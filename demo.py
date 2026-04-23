@@ -25,8 +25,10 @@ import time
 
 # Must be set before `import torch` / any CUDA init. Reduces the reserved-vs-allocated
 # memory gap by letting the caching allocator grow segments on demand instead of
-# pre-reserving fixed-size blocks.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# pre-reserving fixed-size blocks. Mirror the legacy variable if a user still has it
+# set, but prefer the current `PYTORCH_ALLOC_CONF` name to avoid deprecation warnings.
+legacy_alloc_conf = os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+os.environ.setdefault("PYTORCH_ALLOC_CONF", legacy_alloc_conf or "expandable_segments:True")
 
 import cv2
 import numpy as np
@@ -130,7 +132,19 @@ def load_model(args, device):
         ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
         state_dict = ckpt.get("model", ckpt)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
+        point_head_missing = [key for key in missing if key.startswith("point_head.")]
+        other_missing = [key for key in missing if not key.startswith("point_head.")]
+
+        if point_head_missing and not other_missing:
+            # Public checkpoints currently omit point_head weights. Leaving the
+            # randomly initialized head active would produce misleading world points,
+            # while the demo viewer already reconstructs geometry from depth by default.
+            model.point_head = None
+            print(
+                f"  Missing keys: {len(point_head_missing)} point_head weights; "
+                "disabling point_head and using depth-based visualization."
+            )
+        elif missing:
             print(f"  Missing keys: {len(missing)}")
         if unexpected:
             print(f"  Unexpected keys: {len(unexpected)}")
@@ -333,8 +347,9 @@ def main():
     parser.add_argument(
         "--offload_to_cpu",
         action=argparse.BooleanOptionalAction,
+        default=True,
         help="Offload per-frame predictions to CPU during inference to cut GPU peak memory. "
-             "Use --no-offload_to_cpu to keep outputs on GPU.",
+             "Enabled by default; use --no-offload_to_cpu to keep outputs on GPU.",
     )
     # Windowed options
     parser.add_argument("--window_size", type=int, default=64, help="Frames per window (windowed mode)")
