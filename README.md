@@ -196,6 +196,76 @@ python demo.py --model_path /path/to/lingbot-map-long.pt \
     --mode windowed --window_size 128
 ```
 
+### Reliable Video Workflow With `ffmpeg`
+
+For some videos, OpenCV-based `--video_path` extraction can produce missing frame files. If that happens, use the repo script below so `ffmpeg` extracts frames first and `demo.py` runs from `--image_folder`.
+
+```bash
+scripts/run_video_demo.sh \
+    --video /path/to/video.mp4 \
+    --fps 1 \
+    --port 18093
+```
+
+The script defaults to the lower-memory settings that worked in this repo during testing:
+
+- `--use_sdpa`
+- `--num_scale_frames 2`
+- `--camera_num_iterations 1`
+- extract frames into `tmp_frames/` under the repo so it does not depend on free space next to the source video
+
+Example for a denser run at `2 fps`:
+
+```bash
+scripts/run_video_demo.sh \
+    --video /path/to/video.mp4 \
+    --fps 2 \
+    --port 18094
+```
+
+You can pass extra `demo.py` flags after `--`, for example:
+
+```bash
+scripts/run_video_demo.sh \
+    --video /path/to/video.mp4 \
+    --fps 2 \
+    --port 18094 \
+    -- --downsample_factor 6
+```
+
+### Insta360 / 360 Still Workflow
+
+For Insta360-style still captures, the most reliable input for this repo is a normal perspective sequence, not the raw dual-fisheye `.insp` frames.
+
+If you already have a directory like `outdoor_perspectives_8/` with files such as `frame0000_az090_el000.jpg`, run one azimuth as a standard sequence:
+
+```bash
+scripts/run_insta360_demo.sh \
+    --source-dir /path/to/outdoor_perspectives_8 \
+    --input-mode perspective \
+    --azimuth 090 \
+    --port 18097
+```
+
+If you only have raw `.insp` files, the script can also create a conservative center crop from one lens:
+
+```bash
+scripts/run_insta360_demo.sh \
+    --source-dir /path/to/outdoor \
+    --input-mode crop \
+    --lens right \
+    --port 18098
+```
+
+The script defaults to the lower-memory settings that worked during testing on 138-frame Insta360 still sequences:
+
+- `--mode windowed`
+- `--window_size 16`
+- `--overlap_size 4`
+- `--use_sdpa`
+- `--num_scale_frames 2`
+- `--camera_num_iterations 1`
+
 
 ### Sky Masking
 

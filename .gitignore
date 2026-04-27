@@ -13,3 +13,4 @@ CLAUDE.md
 skyseg.onnx
 checkpoints/
 *_sky_masks/
+tmp_frames/
