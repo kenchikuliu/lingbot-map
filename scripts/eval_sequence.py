@@ -166,6 +166,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--ray_conditioning_gate_value", type=float, default=None)
+    parser.add_argument(
+        "--base_model_override",
+        type=str,
+        default=None,
+        help="Optional base checkpoint override used when loading compact ray-conditioning-only checkpoints.",
+    )
     parser.add_argument("--compile", action="store_true", default=False)
     parser.add_argument(
         "--offload_to_cpu",
@@ -298,6 +304,7 @@ def main() -> None:
             "input_intrinsics_file": args.input_intrinsics_file,
             "ray_use_default_intrinsics": bool(args.ray_use_default_intrinsics),
             "ray_conditioning_gate_value": args.ray_conditioning_gate_value,
+            "base_model_override": args.base_model_override,
             "dtype": str(dtype),
         },
         "timing": {

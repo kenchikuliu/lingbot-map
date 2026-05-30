@@ -1,0 +1,78 @@
+{
+  "gpu": {
+    "cuda_available": true,
+    "max_memory_allocated_gb": 6.822974464,
+    "max_memory_reserved_gb": 10.427039744
+  },
+  "input": {
+    "first_k": 24,
+    "fps": 10,
+    "image_folder": "tmp_frames/outdoor_right_center_crops",
+    "num_frames_after_sampling": 24,
+    "num_input_paths": 24,
+    "resolved_image_folder": "tmp_frames/outdoor_right_center_crops",
+    "stride": 1,
+    "video_path": null
+  },
+  "prediction_keys": [
+    "alignment_mode",
+    "chunk_scales",
+    "chunk_transforms",
+    "depth",
+    "depth_conf",
+    "extrinsic",
+    "frame_type",
+    "intrinsic",
+    "is_keyframe",
+    "pose_enc"
+  ],
+  "proxy_metrics": {
+    "depth_conf_frame_mean_std": 0.5998287200927734,
+    "depth_conf_mean": 2.002061367034912,
+    "depth_conf_std": 1.5820170640945435,
+    "depth_mean": 1.2401615381240845,
+    "depth_p95": 3.6172675490379333,
+    "depth_std": 1.1631546020507812,
+    "keyframe_ratio": 1.0,
+    "num_keyframes_observed": 22,
+    "num_non_keyframes_observed": 0,
+    "num_scale_frames_observed": 2,
+    "step_rotation_deg_max": 136.6615447998047,
+    "step_rotation_deg_mean": 38.442012786865234,
+    "step_rotation_deg_std": 43.56548309326172,
+    "step_translation_max": 13.570284843444824,
+    "step_translation_mean": 4.304957389831543,
+    "step_translation_std": 4.215823650360107,
+    "translation_norm_mean": 5.248872756958008,
+    "translation_norm_std": 2.0226662158966064,
+    "valid_depth_ratio_mean": 1.0,
+    "valid_depth_ratio_std": 0.0
+  },
+  "settings": {
+    "base_model_override": "/home/slam/model_cache/lingbot-map.pt",
+    "camera_num_iterations": 1,
+    "dtype": "torch.bfloat16",
+    "enable_ray_conditioning": true,
+    "image_size": 518,
+    "input_camera_model": "pinhole",
+    "input_intrinsics_file": null,
+    "keyframe_interval": 1,
+    "mode": "windowed",
+    "num_scale_frames": 1,
+    "offload_to_cpu": true,
+    "overlap_size": 4,
+    "patch_size": 14,
+    "preprocess_mode": "pad",
+    "ray_conditioning_gate_value": null,
+    "ray_use_default_intrinsics": true,
+    "use_sdpa": true,
+    "window_size": 16
+  },
+  "tag": "outdoor_rightcrop_pad24_from138_select40_best_student_eval_2026-05-30",
+  "timing": {
+    "frames_per_sec_inference": 3.5713910502934096,
+    "inference_time_sec": 6.7200706005096436,
+    "load_time_sec": 11.982914924621582,
+    "postprocess_time_sec": 0.0005674362182617188
+  }
+}

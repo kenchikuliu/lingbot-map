@@ -22,6 +22,7 @@ import argparse
 import glob
 import os
 import time
+from pathlib import Path
 
 # Must be set before `import torch` / any CUDA init. Reduces the reserved-vs-allocated
 # memory gap by letting the caching allocator grow segments on demand instead of
@@ -108,6 +109,105 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
 # Model loading
 # =============================================================================
 
+
+def _report_load_state_result(model, missing, unexpected):
+    point_head_missing = [key for key in missing if key.startswith("point_head.")]
+    ray_condition_missing = [key for key in missing if key.startswith("aggregator.ray_conditioning_")]
+    other_missing = [
+        key
+        for key in missing
+        if not key.startswith("point_head.") and not key.startswith("aggregator.ray_conditioning_")
+    ]
+
+    if point_head_missing and not other_missing:
+        model.point_head = None
+        print(
+            f"  Missing keys: {len(point_head_missing)} point_head weights; "
+            "disabling point_head and using depth-based visualization."
+        )
+        if ray_condition_missing:
+            print(
+                f"  Experimental ray-conditioning params missing: {len(ray_condition_missing)} "
+                "(expected for old checkpoints; using fresh init)."
+            )
+    elif missing:
+        print(f"  Missing keys: {len(missing)}")
+    if unexpected:
+        print(f"  Unexpected keys: {len(unexpected)}")
+
+
+def _resolve_checkpoint_path(path_like, *, relative_to=None):
+    path = Path(path_like).expanduser()
+    if not path.is_absolute() and relative_to is not None:
+        path = relative_to / path
+    return path.resolve()
+
+
+def _apply_partial_state_dict(model, state_dict):
+    model_state = model.state_dict()
+    expected_keys = {key for key in model_state if key.startswith("aggregator.ray_conditioning_")}
+    provided_keys = set(state_dict.keys())
+    missing = sorted(expected_keys - provided_keys)
+    unexpected = []
+    shape_mismatches = []
+    applied = 0
+
+    with torch.no_grad():
+        for key, value in state_dict.items():
+            target = model_state.get(key)
+            if target is None:
+                unexpected.append(key)
+                continue
+            if target.shape != value.shape:
+                shape_mismatches.append((key, tuple(value.shape), tuple(target.shape)))
+                continue
+            target.copy_(value.to(device=target.device, dtype=target.dtype))
+            applied += 1
+
+    return applied, missing, unexpected, shape_mismatches
+
+
+def _load_checkpoint_into_model(model, checkpoint_path, device, *, visited=None, base_model_override=None):
+    checkpoint_path = _resolve_checkpoint_path(checkpoint_path)
+    visited = set() if visited is None else visited
+    if checkpoint_path in visited:
+        raise ValueError(f"Recursive checkpoint reference detected for {checkpoint_path}")
+    visited.add(checkpoint_path)
+
+    ckpt = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+    state_dict = ckpt.get("model", ckpt)
+    state_dict_type = ckpt.get("state_dict_type")
+
+    if state_dict_type == "ray_conditioning_only":
+        base_model_path = base_model_override or ckpt.get("base_model_path")
+        if not base_model_path:
+            raise ValueError(
+                f"Compact checkpoint {checkpoint_path} is missing required 'base_model_path'"
+            )
+        base_model_path = _resolve_checkpoint_path(base_model_path, relative_to=checkpoint_path.parent)
+        print(f"  Compact ray-conditioning checkpoint detected; loading base checkpoint: {base_model_path}")
+        _load_checkpoint_into_model(
+            model,
+            base_model_path,
+            device,
+            visited=visited,
+            base_model_override=base_model_override,
+        )
+
+        applied, missing, unexpected, shape_mismatches = _apply_partial_state_dict(model, state_dict)
+        if missing:
+            print(f"  Missing compact keys: {len(missing)}")
+        if unexpected:
+            print(f"  Unexpected compact keys: {len(unexpected)}")
+        if shape_mismatches:
+            print(f"  Compact key shape mismatches: {len(shape_mismatches)}")
+        print(f"  Applied compact ray-conditioning weights: {applied}")
+        return ckpt
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    _report_load_state_result(model, missing, unexpected)
+    return ckpt
+
 def load_model(args, device):
     """Load GCTStream model from checkpoint."""
     if getattr(args, "mode", "streaming") == "windowed":
@@ -132,36 +232,14 @@ def load_model(args, device):
     )
 
     if args.model_path:
-        print(f"Loading checkpoint: {args.model_path}")
-        ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
-        state_dict = ckpt.get("model", ckpt)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        point_head_missing = [key for key in missing if key.startswith("point_head.")]
-        ray_condition_missing = [key for key in missing if key.startswith("aggregator.ray_conditioning_")]
-        other_missing = [
-            key
-            for key in missing
-            if not key.startswith("point_head.") and not key.startswith("aggregator.ray_conditioning_")
-        ]
-
-        if point_head_missing and not other_missing:
-            # Public checkpoints currently omit point_head weights. Leaving the
-            # randomly initialized head active would produce misleading world points,
-            # while the demo viewer already reconstructs geometry from depth by default.
-            model.point_head = None
-            print(
-                f"  Missing keys: {len(point_head_missing)} point_head weights; "
-                "disabling point_head and using depth-based visualization."
-            )
-            if ray_condition_missing:
-                print(
-                    f"  Experimental ray-conditioning params missing: {len(ray_condition_missing)} "
-                    "(expected for old checkpoints; using fresh init)."
-                )
-        elif missing:
-            print(f"  Missing keys: {len(missing)}")
-        if unexpected:
-            print(f"  Unexpected keys: {len(unexpected)}")
+        checkpoint_path = _resolve_checkpoint_path(args.model_path)
+        print(f"Loading checkpoint: {checkpoint_path}")
+        ckpt = _load_checkpoint_into_model(
+            model,
+            checkpoint_path,
+            device,
+            base_model_override=getattr(args, "base_model_override", None),
+        )
         print("  Checkpoint loaded.")
 
     if getattr(args, "enable_ray_conditioning", False) and getattr(args, "ray_conditioning_gate_value", None) is not None:
@@ -411,6 +489,12 @@ def main():
         default=None,
         help="Diagnostic override for the ray-conditioning gate. "
              "Useful before finetuning; default keeps the zero-init gate from the checkpoint/model.",
+    )
+    parser.add_argument(
+        "--base_model_override",
+        type=str,
+        default=None,
+        help="Optional base checkpoint override used when loading compact ray-conditioning-only checkpoints.",
     )
     parser.add_argument("--compile", action="store_true", default=False,
                         help="torch.compile hot modules (reduce-overhead) with a CUDA-graph warmup. "

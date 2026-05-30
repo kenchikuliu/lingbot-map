@@ -36,6 +36,14 @@ All training runs use:
    - 138-frame training pool
    - 20 steps
    - lr `3e-4`
+6. `pad138_select40_best`
+   - 138-frame training pool
+   - 40 steps
+   - lr `3e-4`
+   - student-side selection enabled
+7. `pad138_select40_final`
+   - same run, final checkpoint
+   - also matched the best student-eval checkpoint on this subset
 
 ## Metric Table
 
@@ -46,6 +54,8 @@ All training runs use:
 | pad24_final | 38.458229 | 136.748734 | 4.334539 | 13.629212 | 1.881228 | 0.543703 | 1.222741 | 5.284243 |
 | pad138_lr1e3_best | 38.464390 | 136.527573 | 4.301548 | 13.574484 | 2.005896 | 0.601128 | 1.240824 | 5.245010 |
 | pad138_lr3e4_best | 38.434792 | 136.440384 | 4.301320 | 13.584756 | 2.033958 | 0.611169 | 1.246335 | 5.246917 |
+| pad138_select40_best | 38.441055 | 136.588623 | 4.300098 | 13.578547 | 2.008447 | 0.602395 | 1.239871 | 5.244617 |
+| pad138_select40_final | 38.442013 | 136.661545 | 4.304957 | 13.570285 | 2.002061 | 0.599829 | 1.240162 | 5.248873 |
 
 ## Delta vs Baseline
 
@@ -93,6 +103,28 @@ All training runs use:
 - `depth_mean`: `-0.003686`
 - `translation_norm_mean`: `-0.012092`
 
+### pad138_select40_best
+
+- `step_rotation_deg_mean`: `+0.011387`
+- `step_rotation_deg_max`: `+0.050781`
+- `step_translation_mean`: `-0.013977`
+- `step_translation_max`: `-0.055176`
+- `depth_conf_mean`: `-0.039539`
+- `depth_conf_frame_mean_std`: `-0.014523`
+- `depth_mean`: `-0.010150`
+- `translation_norm_mean`: `-0.014392`
+
+### pad138_select40_final
+
+- `step_rotation_deg_mean`: `+0.012344`
+- `step_rotation_deg_max`: `+0.123703`
+- `step_translation_mean`: `-0.009118`
+- `step_translation_max`: `-0.063438`
+- `depth_conf_mean`: `-0.045925`
+- `depth_conf_frame_mean_std`: `-0.017089`
+- `depth_mean`: `-0.009859`
+- `translation_norm_mean`: `-0.010137`
+
 ## Interpretation
 
 Two distinct behaviors showed up.
@@ -115,6 +147,17 @@ subset.
 
 This looks more conservative and more balanced.
 
+### 138-frame finetune with student-side selection
+
+- best student-side score improved monotonically from `1.000000` to `0.991940`
+- translation mean improved slightly beyond the earlier `pad138_lr3e4_best`
+- translation max improved further
+- depth-confidence metrics improved further
+- rotation drift became slightly worse than the earlier 20-step balanced run
+
+This looks like a useful next-stage recipe if translation/depth stability is
+the primary objective.
+
 ## Current Best Balanced Checkpoint
 
 If the priority is a balanced proxy improvement rather than the single largest
@@ -122,12 +165,18 @@ depth-confidence gain, the current best candidate is:
 
 - `pad138_lr3e4_best` for the smallest rotation drift with improved translation
   stability, or
-- `pad138_lr1e3_best` if translation max matters more than rotation mean drift
+- `pad138_select40_best` if slightly more rotation drift is acceptable in
+  exchange for better translation/depth-confidence behavior
 
 If the priority is strongest depth-confidence improvement on this exact subset,
 the current best candidate is:
 
 - `pad24_final`
+
+If the priority is strongest translation-max improvement among the longer
+138-frame runs, the current best candidate is:
+
+- `pad138_select40_final`
 
 ## Practical Conclusion
 
@@ -136,8 +185,9 @@ available before:
 
 1. teacher/student cross-folder projection-shift distillation
 2. full geometric supervision with `pad` student preprocessing
-3. meaningful tradeoff exploration between local adaptation and broader-scene
-   regularization
+3. student-side validation-based checkpoint selection on top of that training
+   path
 
-The next optimization step should be checkpoint selection based on explicit
-student-side validation metrics rather than distillation loss alone.
+The next optimization step should be to extend the selection-based 138-frame
+run beyond 40 steps or retune the selection weights for rotation-sensitive
+selection, since the student-side score was still improving at the end.

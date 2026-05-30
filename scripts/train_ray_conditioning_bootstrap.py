@@ -35,9 +35,22 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from demo import load_images, load_model
+from demo import load_images, load_model, postprocess
+from eval_sequence import compute_proxy_metrics
 from lingbot_map.utils import load_input_intrinsics
 from lingbot_map.utils.load_fn import load_and_preprocess_images
+
+
+PROJECTION_SHIFT_SELECTION_WEIGHTS = {
+    "step_rotation_deg_mean": 0.15,
+    "step_rotation_deg_max": 0.15,
+    "step_translation_mean": 0.20,
+    "step_translation_max": 0.20,
+    "depth_conf_mean": 0.10,
+    "depth_conf_frame_mean_std": 0.10,
+    "depth_mean": 0.05,
+    "translation_norm_mean": 0.05,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +67,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=1)
 
     parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument(
+        "--export_base_model_path",
+        type=str,
+        default=None,
+        help="Optional base checkpoint path to embed into compact checkpoints. "
+             "Useful when loading from a local cache but exporting a stable repository path.",
+    )
     parser.add_argument("--image_size", type=int, default=518)
     parser.add_argument("--patch_size", type=int, default=14)
     parser.add_argument("--preprocess_mode", type=str, default="crop", choices=["crop", "pad"])
@@ -82,6 +102,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence_stride", type=int, default=4)
     parser.add_argument("--max_steps", type=int, default=200)
     parser.add_argument("--eval_every", type=int, default=20)
+    parser.add_argument(
+        "--selection_eval_every",
+        type=int,
+        default=0,
+        help="Run student-side proxy evaluation every N training steps. 0 disables validation-based selection.",
+    )
+    parser.add_argument("--selection_eval_image_folder", type=str, default=None)
+    parser.add_argument("--selection_eval_video_path", type=str, default=None)
+    parser.add_argument("--selection_eval_preprocess_mode", type=str, default=None)
+    parser.add_argument("--selection_eval_first_k", type=int, default=None)
+    parser.add_argument("--selection_eval_stride", type=int, default=1)
+    parser.add_argument(
+        "--selection_eval_mode",
+        type=str,
+        default="windowed",
+        choices=["streaming", "windowed"],
+    )
+    parser.add_argument("--selection_eval_window_size", type=int, default=16)
+    parser.add_argument("--selection_eval_overlap_size", type=int, default=4)
+    parser.add_argument("--selection_eval_num_scale_frames", type=int, default=1)
+    parser.add_argument("--selection_eval_camera_num_iterations", type=int, default=1)
+    parser.add_argument(
+        "--selection_metric",
+        type=str,
+        default="balanced_projection_shift",
+        choices=[
+            "balanced_projection_shift",
+            "step_rotation_deg_mean",
+            "step_rotation_deg_max",
+            "step_translation_mean",
+            "step_translation_max",
+            "depth_conf_mean",
+            "depth_conf_frame_mean_std",
+            "depth_mean",
+            "translation_norm_mean",
+        ],
+    )
+    parser.add_argument(
+        "--selection_goal",
+        type=str,
+        default="min",
+        choices=["min", "max"],
+    )
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=0,
+        help="Stop after this many validation rounds without improvement. 0 disables early stopping.",
+    )
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
@@ -348,6 +417,169 @@ def _build_sequence_starts(num_frames: int, sequence_length: int, sequence_strid
     return starts
 
 
+def _prepare_selection_eval_data(
+    args: argparse.Namespace,
+    *,
+    student_images: torch.Tensor,
+    student_paths: list[str],
+    student_resolved_folder: str,
+    student_preprocess_mode: str,
+) -> dict[str, Any] | None:
+    if args.selection_eval_every <= 0:
+        return None
+
+    eval_preprocess_mode = _normalize_preprocess_mode(
+        args.selection_eval_preprocess_mode,
+        student_preprocess_mode,
+    )
+    eval_first_k = args.selection_eval_first_k
+    eval_stride = max(int(args.selection_eval_stride), 1)
+
+    eval_image_folder = args.selection_eval_image_folder
+    eval_video_path = args.selection_eval_video_path
+    can_reuse_student_sequence = (
+        not eval_image_folder
+        and not eval_video_path
+        and eval_preprocess_mode == student_preprocess_mode
+        and eval_stride == 1
+    )
+
+    if can_reuse_student_sequence:
+        eval_images = student_images
+        eval_paths = list(student_paths)
+        resolved_eval_folder = student_resolved_folder
+        if eval_first_k is not None:
+            eval_images = eval_images[:eval_first_k]
+            eval_paths = eval_paths[:eval_first_k]
+    else:
+        eval_image_folder = eval_image_folder or args.student_image_folder or args.image_folder
+        eval_video_path = eval_video_path or args.student_video_path or args.video_path
+        eval_images, eval_paths, resolved_eval_folder = load_images(
+            image_folder=eval_image_folder,
+            video_path=eval_video_path,
+            fps=args.fps,
+            first_k=eval_first_k,
+            stride=eval_stride,
+            image_size=args.image_size,
+            patch_size=args.patch_size,
+            preprocess_mode=eval_preprocess_mode,
+        )
+
+    if len(eval_paths) < 2:
+        raise ValueError("Selection evaluation needs at least 2 frames")
+
+    eval_kwargs_all = _build_all_input_kwargs(
+        eval_paths,
+        image_size=args.image_size,
+        patch_size=args.patch_size,
+        preprocess_mode=eval_preprocess_mode,
+        camera_model=args.student_input_camera_model,
+        intrinsics_file=args.student_input_intrinsics_file,
+    )
+    return {
+        "images": eval_images,
+        "paths": eval_paths,
+        "resolved_folder": resolved_eval_folder,
+        "preprocess_mode": eval_preprocess_mode,
+        "kwargs": eval_kwargs_all,
+    }
+
+
+def _run_student_proxy_eval(
+    model: torch.nn.Module,
+    *,
+    images_cpu: torch.Tensor,
+    kwargs: dict[str, Any],
+    dtype: torch.dtype,
+    args: argparse.Namespace,
+) -> dict[str, float | int | None]:
+    was_training = model.training
+    original_camera_iterations = getattr(model, "camera_num_iterations", None)
+    output_device = torch.device("cpu")
+    model_device = next(model.parameters()).device
+
+    if original_camera_iterations is not None:
+        model.camera_num_iterations = args.selection_eval_camera_num_iterations
+
+    model.eval()
+    model.clean_kv_cache()
+    images = images_cpu.unsqueeze(0).to(model_device)
+    selected_mode = args.selection_eval_mode
+    if selected_mode == "windowed" and not hasattr(model, "inference_windowed"):
+        selected_mode = "streaming"
+    try:
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=(model_device.type == "cuda"), dtype=dtype):
+            if selected_mode == "streaming":
+                predictions = model.inference_streaming(
+                    images,
+                    num_scale_frames=args.selection_eval_num_scale_frames,
+                    keyframe_interval=1,
+                    output_device=output_device,
+                    **kwargs,
+                )
+            else:
+                predictions = model.inference_windowed(
+                    images,
+                    window_size=args.selection_eval_window_size,
+                    overlap_size=args.selection_eval_overlap_size,
+                    num_scale_frames=args.selection_eval_num_scale_frames,
+                    output_device=output_device,
+                    **kwargs,
+                )
+        images_for_post = predictions["images"] if "images" in predictions else images
+        predictions, _ = postprocess(predictions, images_for_post)
+        metrics = compute_proxy_metrics(predictions)
+        metrics["selection_eval_mode_used"] = selected_mode
+    finally:
+        model.clean_kv_cache()
+        if original_camera_iterations is not None:
+            model.camera_num_iterations = original_camera_iterations
+        if was_training:
+            model.train()
+        if "predictions" in locals():
+            del predictions
+        del images
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return metrics
+
+
+def _score_selection_metrics(
+    metrics: dict[str, Any],
+    *,
+    baseline_metrics: dict[str, Any] | None,
+    selection_metric: str,
+) -> float:
+    if selection_metric == "balanced_projection_shift":
+        if baseline_metrics is None:
+            raise ValueError("balanced_projection_shift scoring requires baseline metrics")
+        score = 0.0
+        for key, weight in PROJECTION_SHIFT_SELECTION_WEIGHTS.items():
+            value = metrics.get(key)
+            baseline = baseline_metrics.get(key)
+            if value is None or baseline is None:
+                raise ValueError(f"Missing metric '{key}' for balanced selection scoring")
+            baseline = float(baseline)
+            if abs(baseline) < 1e-8:
+                raise ValueError(f"Baseline metric '{key}' is too small for normalized scoring")
+            score += weight * (float(value) / baseline)
+        return score
+
+    value = metrics.get(selection_metric)
+    if value is None:
+        raise ValueError(f"Missing metric '{selection_metric}' in selection evaluation output")
+    return float(value)
+
+
+def _is_better_selection_score(score: float, best_score: float, goal: str) -> bool:
+    if goal == "min":
+        return score < best_score
+    if goal == "max":
+        return score > best_score
+    raise ValueError(f"Unsupported selection goal: {goal}")
+
+
 def _compute_distill_loss(
     student_pred: dict[str, torch.Tensor],
     teacher_pred: dict[str, torch.Tensor],
@@ -491,6 +723,35 @@ def _cpu_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
 
+def _cpu_ray_conditioning_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Save only the trainable experimental ray-conditioning weights."""
+    ray_state: dict[str, torch.Tensor] = {}
+    for key, value in model.state_dict().items():
+        if key.startswith("aggregator.ray_conditioning_"):
+            ray_state[key] = value.detach().cpu().clone()
+    if not ray_state:
+        raise ValueError("No ray-conditioning weights found for compact checkpoint export")
+    return ray_state
+
+
+def _build_compact_checkpoint(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    args: argparse.Namespace,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    export_base_model_path = args.export_base_model_path or args.model_path
+    payload: dict[str, Any] = {
+        "model": state_dict,
+        "state_dict_type": "ray_conditioning_only",
+        "base_model_path": str(Path(export_base_model_path).expanduser().resolve()),
+        "config": vars(args),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
 def main() -> None:
     args = parse_args()
     if not any(
@@ -584,6 +845,13 @@ def main() -> None:
             camera_model=args.student_input_camera_model,
             intrinsics_file=args.student_input_intrinsics_file,
         )
+    selection_eval_data = _prepare_selection_eval_data(
+        args,
+        student_images=student_images,
+        student_paths=student_paths,
+        student_resolved_folder=student_resolved_folder,
+        student_preprocess_mode=student_preprocess_mode,
+    )
 
     starts = _build_sequence_starts(num_frames, min(args.sequence_length, num_frames), args.sequence_stride)
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
@@ -596,6 +864,16 @@ def main() -> None:
     best_state_dict = None
     best_dual_view_loss = math.inf
     best_dual_view_state_dict = None
+    best_student_eval_score = math.inf if args.selection_goal == "min" else -math.inf
+    best_student_eval_state_dict = None
+    best_student_eval_metrics = None
+    best_student_eval_step = None
+    selection_eval_history: list[dict[str, Any]] = []
+    selection_baseline_metrics = None
+    selection_baseline_score = None
+    selection_eval_rounds_without_improve = 0
+    stopped_early = False
+    stop_reason = None
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -613,6 +891,36 @@ def main() -> None:
             f"Student dual view: {args.student_dual_view_preprocess_mode} "
             f"with shape {tuple(student_dual_view_images.shape)}"
         )
+    if selection_eval_data is not None:
+        print(
+            f"Selection eval: {selection_eval_data['resolved_folder']} "
+            f"({selection_eval_data['preprocess_mode']}), every {args.selection_eval_every} steps, "
+            f"metric={args.selection_metric}, goal={args.selection_goal}"
+        )
+        selection_baseline_metrics = _run_student_proxy_eval(
+            student,
+            images_cpu=selection_eval_data["images"],
+            kwargs=selection_eval_data["kwargs"],
+            dtype=student_dtype,
+            args=args,
+        )
+        selection_baseline_score = _score_selection_metrics(
+            selection_baseline_metrics,
+            baseline_metrics=selection_baseline_metrics,
+            selection_metric=args.selection_metric,
+        )
+        best_student_eval_score = selection_baseline_score
+        best_student_eval_state_dict = _cpu_ray_conditioning_state_dict(student)
+        best_student_eval_metrics = dict(selection_baseline_metrics)
+        best_student_eval_step = 0
+        selection_eval_history.append(
+            {
+                "step": 0,
+                "score": selection_baseline_score,
+                "metrics": selection_baseline_metrics,
+            }
+        )
+        print(f"Initial selection score: {selection_baseline_score:.6f}")
 
     for step in range(1, args.max_steps + 1):
         start_idx = random.choice(starts)
@@ -690,10 +998,10 @@ def main() -> None:
 
         if scalar_losses["total"] < best_loss:
             best_loss = scalar_losses["total"]
-            best_state_dict = _cpu_state_dict(student)
+            best_state_dict = _cpu_ray_conditioning_state_dict(student)
         if use_dual_view and scalar_losses["total"] < best_dual_view_loss:
             best_dual_view_loss = scalar_losses["total"]
-            best_dual_view_state_dict = _cpu_state_dict(student)
+            best_dual_view_state_dict = _cpu_ray_conditioning_state_dict(student)
 
         if step == 1 or step % args.eval_every == 0 or step == args.max_steps:
             print(
@@ -702,6 +1010,63 @@ def main() -> None:
                 f"conf={scalar_losses['depth_conf']:.6f} gate_mean={gate_mean:.6f}"
             )
 
+        if selection_eval_data is not None and (
+            step % args.selection_eval_every == 0 or step == args.max_steps
+        ):
+            student_eval_metrics = _run_student_proxy_eval(
+                student,
+                images_cpu=selection_eval_data["images"],
+                kwargs=selection_eval_data["kwargs"],
+                dtype=student_dtype,
+                args=args,
+            )
+            student_eval_score = _score_selection_metrics(
+                student_eval_metrics,
+                baseline_metrics=selection_baseline_metrics,
+                selection_metric=args.selection_metric,
+            )
+            selection_eval_entry = {
+                "step": step,
+                "score": student_eval_score,
+                "metrics": student_eval_metrics,
+            }
+            selection_eval_history.append(selection_eval_entry)
+            log_entry["student_eval_score"] = student_eval_score
+            log_entry["student_eval_metrics"] = student_eval_metrics
+
+            if _is_better_selection_score(student_eval_score, best_student_eval_score, args.selection_goal):
+                best_student_eval_score = student_eval_score
+                best_student_eval_state_dict = _cpu_ray_conditioning_state_dict(student)
+                best_student_eval_metrics = dict(student_eval_metrics)
+                best_student_eval_step = step
+                selection_eval_rounds_without_improve = 0
+                print(
+                    f"  new best student-eval score at step {step}: "
+                    f"{student_eval_score:.6f}"
+                )
+            else:
+                selection_eval_rounds_without_improve += 1
+                print(
+                    f"  student-eval score at step {step}: {student_eval_score:.6f} "
+                    f"(best {best_student_eval_score:.6f} at step {best_student_eval_step})"
+                )
+
+            if (
+                args.early_stop_patience > 0
+                and selection_eval_rounds_without_improve >= args.early_stop_patience
+                and step < args.max_steps
+            ):
+                stopped_early = True
+                stop_reason = (
+                    f"no student-eval improvement for {selection_eval_rounds_without_improve} "
+                    f"selection rounds"
+                )
+                print(f"Early stopping at step {step}: {stop_reason}")
+                teacher.clean_kv_cache()
+                student.clean_kv_cache()
+                del teacher_pred, student_pred, teacher_chunk, student_chunk, total_loss
+                break
+
         teacher.clean_kv_cache()
         student.clean_kv_cache()
         del teacher_pred, student_pred, teacher_chunk, student_chunk, total_loss
@@ -709,25 +1074,47 @@ def main() -> None:
     checkpoint_path = output_dir / "ray_conditioning_bootstrap_best.pt"
     final_checkpoint_path = output_dir / "ray_conditioning_bootstrap_final.pt"
     dual_view_checkpoint_path = output_dir / "ray_conditioning_bootstrap_best_dual_view.pt"
+    student_eval_checkpoint_path = output_dir / "ray_conditioning_bootstrap_best_student_eval.pt"
     if best_state_dict is None:
         raise RuntimeError("No checkpoint state captured during training")
-    torch.save({"model": best_state_dict, "config": vars(args), "best_loss": best_loss}, checkpoint_path)
     torch.save(
-        {
-            "model": _cpu_state_dict(student),
-            "config": vars(args),
-            "final_loss": history[-1]["total"] if history else None,
-        },
+        _build_compact_checkpoint(
+            best_state_dict,
+            args=args,
+            extra={"best_loss": best_loss},
+        ),
+        checkpoint_path,
+    )
+    torch.save(
+        _build_compact_checkpoint(
+            _cpu_ray_conditioning_state_dict(student),
+            args=args,
+            extra={"final_loss": history[-1]["total"] if history else None},
+        ),
         final_checkpoint_path,
     )
     if best_dual_view_state_dict is not None:
         torch.save(
-            {
-                "model": best_dual_view_state_dict,
-                "config": vars(args),
-                "best_dual_view_loss": best_dual_view_loss,
-            },
+            _build_compact_checkpoint(
+                best_dual_view_state_dict,
+                args=args,
+                extra={"best_dual_view_loss": best_dual_view_loss},
+            ),
             dual_view_checkpoint_path,
+        )
+    if best_student_eval_state_dict is not None:
+        torch.save(
+            _build_compact_checkpoint(
+                best_student_eval_state_dict,
+                args=args,
+                extra={
+                    "best_student_eval_score": best_student_eval_score,
+                    "best_student_eval_step": best_student_eval_step,
+                    "selection_metric": args.selection_metric,
+                    "selection_goal": args.selection_goal,
+                },
+            ),
+            student_eval_checkpoint_path,
         )
 
     summary = {
@@ -759,8 +1146,19 @@ def main() -> None:
             "best_dual_view_checkpoint_path": (
                 str(dual_view_checkpoint_path) if best_dual_view_state_dict is not None else None
             ),
+            "best_student_eval_score": best_student_eval_score if best_student_eval_state_dict is not None else None,
+            "best_student_eval_step": best_student_eval_step,
+            "best_student_eval_checkpoint_path": (
+                str(student_eval_checkpoint_path) if best_student_eval_state_dict is not None else None
+            ),
+            "selection_baseline_score": selection_baseline_score,
+            "selection_baseline_metrics": selection_baseline_metrics,
+            "best_student_eval_metrics": best_student_eval_metrics,
+            "stopped_early": stopped_early,
+            "stop_reason": stop_reason,
         },
         "history": history,
+        "selection_eval_history": selection_eval_history,
     }
     summary_path = output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -768,6 +1166,8 @@ def main() -> None:
     print(f"Saved final checkpoint to {final_checkpoint_path}")
     if best_dual_view_state_dict is not None:
         print(f"Saved best dual-view checkpoint to {dual_view_checkpoint_path}")
+    if best_student_eval_state_dict is not None:
+        print(f"Saved best student-eval checkpoint to {student_eval_checkpoint_path}")
     print(f"Saved summary to {summary_path}")
 
 
