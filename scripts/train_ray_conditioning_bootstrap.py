@@ -45,6 +45,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--image_folder", type=str, default=None)
     parser.add_argument("--video_path", type=str, default=None)
+    parser.add_argument("--teacher_image_folder", type=str, default=None)
+    parser.add_argument("--teacher_video_path", type=str, default=None)
+    parser.add_argument("--student_image_folder", type=str, default=None)
+    parser.add_argument("--student_video_path", type=str, default=None)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--first_k", type=int, default=None)
     parser.add_argument("--stride", type=int, default=1)
@@ -53,6 +57,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_size", type=int, default=518)
     parser.add_argument("--patch_size", type=int, default=14)
     parser.add_argument("--preprocess_mode", type=str, default="crop", choices=["crop", "pad"])
+    parser.add_argument("--teacher_preprocess_mode", type=str, default=None)
+    parser.add_argument("--student_preprocess_mode", type=str, default=None)
+    parser.add_argument(
+        "--pairing_mode",
+        type=str,
+        default="ordered",
+        choices=["ordered", "basename"],
+        help="How to align teacher/student frames when the sources differ.",
+    )
     parser.add_argument("--enable_3d_rope", action="store_true", default=True)
     parser.add_argument("--max_frame_num", type=int, default=1024)
     parser.add_argument("--num_scale_frames", type=int, default=8)
@@ -155,6 +168,101 @@ def _build_model_args(base_args: argparse.Namespace, *, enable_ray_conditioning:
     args.ray_use_default_intrinsics = True
     args.ray_conditioning_gate_value = gate_value
     return args
+
+
+def _normalize_preprocess_mode(mode: str | None, fallback: str) -> str:
+    resolved = fallback if mode is None else mode
+    if resolved not in {"crop", "pad"}:
+        raise ValueError(f"Unsupported preprocess mode: {resolved}")
+    return resolved
+
+
+def _resolve_role_source(
+    args: argparse.Namespace,
+    role: str,
+) -> tuple[str | None, str | None, str]:
+    image_folder = getattr(args, f"{role}_image_folder") or args.image_folder
+    video_path = getattr(args, f"{role}_video_path") or args.video_path
+    preprocess_mode = _normalize_preprocess_mode(
+        getattr(args, f"{role}_preprocess_mode"),
+        args.preprocess_mode,
+    )
+    if not image_folder and not video_path:
+        raise ValueError(f"No input source available for role={role}")
+    return image_folder, video_path, preprocess_mode
+
+
+def _load_role_sequence(
+    args: argparse.Namespace,
+    role: str,
+) -> tuple[torch.Tensor, list[str], str, str]:
+    image_folder, video_path, preprocess_mode = _resolve_role_source(args, role)
+    images, paths, resolved_folder = load_images(
+        image_folder=image_folder,
+        video_path=video_path,
+        fps=args.fps,
+        first_k=args.first_k,
+        stride=args.stride,
+        image_size=args.image_size,
+        patch_size=args.patch_size,
+        preprocess_mode=preprocess_mode,
+    )
+    return images, paths, resolved_folder, preprocess_mode
+
+
+def _path_lookup_tokens(path_like: str) -> list[str]:
+    raw = str(path_like).replace("\\", "/")
+    path = Path(raw)
+    tokens: list[str] = []
+    for token in (raw, path.name, path.stem):
+        if token and token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _pair_sequence_indices(
+    teacher_paths: list[str],
+    student_paths: list[str],
+    pairing_mode: str,
+) -> tuple[list[int], list[int]]:
+    if pairing_mode == "ordered":
+        if len(teacher_paths) != len(student_paths):
+            raise ValueError(
+                "Ordered pairing requires equal teacher/student frame counts, "
+                f"got teacher={len(teacher_paths)} student={len(student_paths)}"
+            )
+        indices = list(range(len(teacher_paths)))
+        return indices, indices
+
+    if pairing_mode == "basename":
+        student_lookup: dict[str, int] = {}
+        for idx, path in enumerate(student_paths):
+            for token in _path_lookup_tokens(path):
+                student_lookup.setdefault(token, idx)
+
+        teacher_indices: list[int] = []
+        student_indices: list[int] = []
+        used_students: set[int] = set()
+        for teacher_idx, path in enumerate(teacher_paths):
+            student_idx = next(
+                (
+                    student_lookup[token]
+                    for token in _path_lookup_tokens(path)
+                    if token in student_lookup and student_lookup[token] not in used_students
+                ),
+                None,
+            )
+            if student_idx is None:
+                continue
+            teacher_indices.append(teacher_idx)
+            student_indices.append(student_idx)
+            used_students.add(student_idx)
+
+        if not teacher_indices:
+            raise ValueError("Basename pairing found no overlapping frames between teacher and student inputs")
+        return teacher_indices, student_indices
+
+    raise ValueError(f"Unsupported pairing_mode: {pairing_mode}")
 
 
 def _maybe_cast_aggregator(model: torch.nn.Module) -> torch.dtype:
@@ -385,8 +493,19 @@ def _cpu_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
 
 def main() -> None:
     args = parse_args()
-    if not args.image_folder and not args.video_path:
-        raise SystemExit("Provide --image_folder or --video_path")
+    if not any(
+        [
+            args.image_folder,
+            args.video_path,
+            args.teacher_image_folder,
+            args.teacher_video_path,
+            args.student_image_folder,
+            args.student_video_path,
+        ]
+    ):
+        raise SystemExit(
+            "Provide shared --image_folder/--video_path or role-specific teacher/student sources"
+        )
 
     seed_everything(args.seed)
     output_dir = Path(args.output_dir)
@@ -395,17 +514,24 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     t0 = time.time()
-    images, paths, resolved_image_folder = load_images(
-        image_folder=args.image_folder,
-        video_path=args.video_path,
-        fps=args.fps,
-        first_k=args.first_k,
-        stride=args.stride,
-        image_size=args.image_size,
-        patch_size=args.patch_size,
-        preprocess_mode=args.preprocess_mode,
+    teacher_images, teacher_paths, teacher_resolved_folder, teacher_preprocess_mode = _load_role_sequence(
+        args,
+        "teacher",
     )
-    num_frames = int(images.shape[0])
+    student_images, student_paths, student_resolved_folder, student_preprocess_mode = _load_role_sequence(
+        args,
+        "student",
+    )
+    teacher_pair_indices, student_pair_indices = _pair_sequence_indices(
+        teacher_paths,
+        student_paths,
+        args.pairing_mode,
+    )
+    teacher_images = teacher_images[teacher_pair_indices]
+    student_images = student_images[student_pair_indices]
+    teacher_paths = [teacher_paths[idx] for idx in teacher_pair_indices]
+    student_paths = [student_paths[idx] for idx in student_pair_indices]
+    num_frames = int(len(teacher_paths))
     if num_frames < 2:
         raise SystemExit("Need at least 2 frames for bootstrap training")
 
@@ -427,23 +553,23 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     teacher_kwargs_all = _build_all_input_kwargs(
-        paths,
+        teacher_paths,
         image_size=args.image_size,
         patch_size=args.patch_size,
-        preprocess_mode=args.preprocess_mode,
+        preprocess_mode=teacher_preprocess_mode,
         camera_model=args.teacher_input_camera_model,
         intrinsics_file=args.teacher_input_intrinsics_file,
     )
     student_kwargs_all = _build_all_input_kwargs(
-        paths,
+        student_paths,
         image_size=args.image_size,
         patch_size=args.patch_size,
-        preprocess_mode=args.preprocess_mode,
+        preprocess_mode=student_preprocess_mode,
         camera_model=args.student_input_camera_model,
         intrinsics_file=args.student_input_intrinsics_file,
     )
     student_dual_view_images = _maybe_load_dual_view_images(
-        paths,
+        student_paths,
         image_size=args.image_size,
         patch_size=args.patch_size,
         preprocess_mode=args.student_dual_view_preprocess_mode,
@@ -451,7 +577,7 @@ def main() -> None:
     student_dual_view_kwargs_all = None
     if student_dual_view_images is not None:
         student_dual_view_kwargs_all = _build_all_input_kwargs(
-            paths,
+            student_paths,
             image_size=args.image_size,
             patch_size=args.patch_size,
             preprocess_mode=args.student_dual_view_preprocess_mode,
@@ -462,16 +588,22 @@ def main() -> None:
     starts = _build_sequence_starts(num_frames, min(args.sequence_length, num_frames), args.sequence_stride)
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
-    images_cpu = images
+    teacher_images_cpu = teacher_images
+    student_images_cpu = student_images
     scale_frames = min(args.num_scale_frames, args.sequence_length, num_frames)
     history: list[dict[str, Any]] = []
     best_loss = math.inf
     best_state_dict = None
+    best_dual_view_loss = math.inf
+    best_dual_view_state_dict = None
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    print(f"Loaded {num_frames} frames from {resolved_image_folder}")
+    print(f"Loaded {num_frames} paired frames")
+    print(f"Teacher source: {teacher_resolved_folder} ({teacher_preprocess_mode})")
+    print(f"Student source: {student_resolved_folder} ({student_preprocess_mode})")
+    print(f"Pairing mode: {args.pairing_mode}")
     print(f"Training on {len(starts)} temporal chunks, sequence_length={min(args.sequence_length, num_frames)}")
     print(f"Teacher camera model: {args.teacher_input_camera_model}")
     print(f"Student camera model: {args.student_input_camera_model}")
@@ -485,15 +617,15 @@ def main() -> None:
     for step in range(1, args.max_steps + 1):
         start_idx = random.choice(starts)
         end_idx = min(start_idx + args.sequence_length, num_frames)
-        teacher_chunk = images_cpu[start_idx:end_idx].unsqueeze(0).to(device)
+        teacher_chunk = teacher_images_cpu[start_idx:end_idx].unsqueeze(0).to(device)
         use_dual_view = (
             student_dual_view_images is not None
             and args.dual_view_distill_prob > 0
             and random.random() < args.dual_view_distill_prob
         )
-        student_images_source = student_dual_view_images if use_dual_view else images_cpu
+        student_images_source = student_dual_view_images if use_dual_view else student_images_cpu
         student_kwargs_source = student_dual_view_kwargs_all if use_dual_view else student_kwargs_all
-        student_view_mode = args.student_dual_view_preprocess_mode if use_dual_view else args.preprocess_mode
+        student_view_mode = args.student_dual_view_preprocess_mode if use_dual_view else student_preprocess_mode
         student_chunk = student_images_source[start_idx:end_idx].unsqueeze(0).to(device)
         teacher_scale = min(scale_frames, teacher_chunk.shape[1])
         student_scale = min(scale_frames, student_chunk.shape[1])
@@ -559,6 +691,9 @@ def main() -> None:
         if scalar_losses["total"] < best_loss:
             best_loss = scalar_losses["total"]
             best_state_dict = _cpu_state_dict(student)
+        if use_dual_view and scalar_losses["total"] < best_dual_view_loss:
+            best_dual_view_loss = scalar_losses["total"]
+            best_dual_view_state_dict = _cpu_state_dict(student)
 
         if step == 1 or step % args.eval_every == 0 or step == args.max_steps:
             print(
@@ -572,15 +707,38 @@ def main() -> None:
         del teacher_pred, student_pred, teacher_chunk, student_chunk, total_loss
 
     checkpoint_path = output_dir / "ray_conditioning_bootstrap_best.pt"
+    final_checkpoint_path = output_dir / "ray_conditioning_bootstrap_final.pt"
+    dual_view_checkpoint_path = output_dir / "ray_conditioning_bootstrap_best_dual_view.pt"
     if best_state_dict is None:
         raise RuntimeError("No checkpoint state captured during training")
     torch.save({"model": best_state_dict, "config": vars(args), "best_loss": best_loss}, checkpoint_path)
+    torch.save(
+        {
+            "model": _cpu_state_dict(student),
+            "config": vars(args),
+            "final_loss": history[-1]["total"] if history else None,
+        },
+        final_checkpoint_path,
+    )
+    if best_dual_view_state_dict is not None:
+        torch.save(
+            {
+                "model": best_dual_view_state_dict,
+                "config": vars(args),
+                "best_dual_view_loss": best_dual_view_loss,
+            },
+            dual_view_checkpoint_path,
+        )
 
     summary = {
         "input": {
-            "resolved_image_folder": resolved_image_folder,
+            "teacher_resolved_image_folder": teacher_resolved_folder,
+            "student_resolved_image_folder": student_resolved_folder,
             "num_frames": num_frames,
             "num_chunks": len(starts),
+            "pairing_mode": args.pairing_mode,
+            "teacher_preprocess_mode": teacher_preprocess_mode,
+            "student_preprocess_mode": student_preprocess_mode,
         },
         "settings": {
             **vars(args),
@@ -596,12 +754,20 @@ def main() -> None:
             ),
             "elapsed_sec": time.time() - t0,
             "checkpoint_path": str(checkpoint_path),
+            "final_checkpoint_path": str(final_checkpoint_path),
+            "best_dual_view_loss": (best_dual_view_loss if best_dual_view_state_dict is not None else None),
+            "best_dual_view_checkpoint_path": (
+                str(dual_view_checkpoint_path) if best_dual_view_state_dict is not None else None
+            ),
         },
         "history": history,
     }
     summary_path = output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(f"Saved best checkpoint to {checkpoint_path}")
+    print(f"Saved final checkpoint to {final_checkpoint_path}")
+    if best_dual_view_state_dict is not None:
+        print(f"Saved best dual-view checkpoint to {dual_view_checkpoint_path}")
     print(f"Saved summary to {summary_path}")
 
 

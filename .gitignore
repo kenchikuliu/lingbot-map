@@ -16,3 +16,4 @@ checkpoints/
 tmp_frames/
 research_eval/**/*.pt
 research_eval/**/prepared_*/
+research_eval/aggregated/*.png

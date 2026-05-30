@@ -99,6 +99,19 @@ Projection-shift adaptation:
 - teacher: perspective baseline or stronger offline reconstructor
 - student: 360-derived / wide-FoV / projection-shifted input
 
+Current script support:
+
+- role-specific sequence sources:
+  - `--teacher_image_folder`
+  - `--teacher_video_path`
+  - `--student_image_folder`
+  - `--student_video_path`
+- role-specific preprocessing:
+  - `--teacher_preprocess_mode`
+  - `--student_preprocess_mode`
+- frame alignment:
+  - `--pairing_mode ordered|basename`
+
 This stage is where the paper claim begins, but it should come only after
 Stage 1 and Stage 2 are stable.
 
@@ -143,6 +156,62 @@ Stage 1 and Stage 2 are stable.
   --dual_view_distill_prob 0.5 \
   --output_dir "research_eval/ray_bootstrap/video_fps2_24_step20_dualview"
 ```
+
+## Recommended Stage 3 smoke run
+
+Use paired teacher/student image folders from the same scene:
+
+- teacher:
+  `tmp_frames/outdoor_perspectives_8_az135_el000`
+- student:
+  `tmp_frames/outdoor_right_center_crops`
+
+First verify the cross-folder path with conservative crop preprocessing:
+
+```bash
+/home/slam/anaconda3/envs/paper_gen/bin/python scripts/train_ray_conditioning_bootstrap.py \
+  --teacher_image_folder "tmp_frames/outdoor_perspectives_8_az135_el000" \
+  --student_image_folder "tmp_frames/outdoor_right_center_crops" \
+  --model_path "checkpoints/lingbot-map.pt" \
+  --first_k 24 \
+  --use_sdpa \
+  --sequence_length 4 \
+  --sequence_stride 2 \
+  --max_steps 10 \
+  --offload_teacher_to_cpu \
+  --teacher_input_camera_model pinhole \
+  --student_input_camera_model pinhole \
+  --output_dir "research_eval/ray_bootstrap/outdoor_projshift_teacher_az135_rightcrop_smoke"
+```
+
+Then run a lighter square-pad recipe so depth and depth-confidence losses can
+participate:
+
+```bash
+/home/slam/anaconda3/envs/paper_gen/bin/python scripts/train_ray_conditioning_bootstrap.py \
+  --teacher_image_folder "tmp_frames/outdoor_perspectives_8_az135_el000" \
+  --student_image_folder "tmp_frames/outdoor_right_center_crops" \
+  --student_preprocess_mode pad \
+  --model_path "checkpoints/lingbot-map.pt" \
+  --first_k 12 \
+  --use_sdpa \
+  --sequence_length 2 \
+  --sequence_stride 1 \
+  --num_scale_frames 1 \
+  --camera_num_iterations 1 \
+  --max_steps 6 \
+  --offload_teacher_to_cpu \
+  --teacher_input_camera_model pinhole \
+  --student_input_camera_model pinhole \
+  --output_dir "research_eval/ray_bootstrap/outdoor_projshift_teacher_az135_rightcrop_pad_smoke12"
+```
+
+Observed practical constraint on this 16 GB GPU:
+
+- full 24-frame `pad` projection-shift distillation can OOM once depth-head
+  supervision is active
+- a smaller `first_k/sequence_length/num_scale_frames` recipe is currently the
+  reliable path
 
 ## Success criteria
 
