@@ -35,6 +35,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from lingbot_map.utils import load_input_intrinsics
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
 from lingbot_map.utils.geometry import closed_form_inverse_se3_general
 from lingbot_map.utils.load_fn import load_and_preprocess_images
@@ -45,7 +46,8 @@ from lingbot_map.utils.load_fn import load_and_preprocess_images
 # =============================================================================
 
 def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png",
-                first_k=None, stride=1, image_size=518, patch_size=14, num_workers=8):
+                first_k=None, stride=1, image_size=518, patch_size=14, num_workers=8,
+                preprocess_mode="crop"):
     """Load images from folder or video and preprocess into a tensor.
 
     Returns:
@@ -93,12 +95,12 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
     print(f"Loading {len(paths)} images...")
     images = load_and_preprocess_images(
         paths,
-        mode="crop",
+        mode=preprocess_mode,
         image_size=image_size,
         patch_size=patch_size,
     )
     h, w = images.shape[-2:]
-    print(f"Preprocessed images to {w}x{h} using canonical crop mode")
+    print(f"Preprocessed images to {w}x{h} using {preprocess_mode} mode")
     return images, paths, resolved_folder
 
 
@@ -125,6 +127,8 @@ def load_model(args, device):
         kv_cache_include_scale_frames=True,
         use_sdpa=args.use_sdpa,
         camera_num_iterations=args.camera_num_iterations,
+        enable_ray_conditioning=getattr(args, "enable_ray_conditioning", False),
+        ray_conditioning_use_default_intrinsics=getattr(args, "ray_use_default_intrinsics", True),
     )
 
     if args.model_path:
@@ -133,7 +137,12 @@ def load_model(args, device):
         state_dict = ckpt.get("model", ckpt)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         point_head_missing = [key for key in missing if key.startswith("point_head.")]
-        other_missing = [key for key in missing if not key.startswith("point_head.")]
+        ray_condition_missing = [key for key in missing if key.startswith("aggregator.ray_conditioning_")]
+        other_missing = [
+            key
+            for key in missing
+            if not key.startswith("point_head.") and not key.startswith("aggregator.ray_conditioning_")
+        ]
 
         if point_head_missing and not other_missing:
             # Public checkpoints currently omit point_head weights. Leaving the
@@ -144,11 +153,23 @@ def load_model(args, device):
                 f"  Missing keys: {len(point_head_missing)} point_head weights; "
                 "disabling point_head and using depth-based visualization."
             )
+            if ray_condition_missing:
+                print(
+                    f"  Experimental ray-conditioning params missing: {len(ray_condition_missing)} "
+                    "(expected for old checkpoints; using fresh init)."
+                )
         elif missing:
             print(f"  Missing keys: {len(missing)}")
         if unexpected:
             print(f"  Unexpected keys: {len(unexpected)}")
         print("  Checkpoint loaded.")
+
+    if getattr(args, "enable_ray_conditioning", False) and getattr(args, "ray_conditioning_gate_value", None) is not None:
+        gate = getattr(model.aggregator, "ray_conditioning_gate", None)
+        if gate is not None:
+            gate_value = float(getattr(args, "ray_conditioning_gate_value"))
+            gate.data.fill_(gate_value)
+            print(f"  Set ray-conditioning gate to {gate_value:.4f}")
 
     return model.to(device).eval()
 
@@ -176,7 +197,7 @@ def compile_model(model):
         b.attn.proj = torch.compile(b.attn.proj, mode="reduce-overhead")
 
 
-def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype, passes=1):
+def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype, passes=1, forward_kwargs=None):
     """Drive `clean_kv_cache → Phase 1 → N streaming forwards` `passes` times.
 
     Warmup inputs are sliced from the already-preprocessed `images` tensor, so their
@@ -186,25 +207,35 @@ def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype, passes=1)
     # images: [S, 3, H, W] on device already; slice and add batch dim.
     warm_scale = images[:scale_frames].unsqueeze(0).to(dtype)
     warm_stream = images[scale_frames:scale_frames + warm_stream_n].unsqueeze(0).to(dtype)
+    forward_kwargs = {} if forward_kwargs is None else dict(forward_kwargs)
 
     for _ in range(passes):
         model.clean_kv_cache()
         torch.compiler.cudagraph_mark_step_begin()
+        scale_kwargs = model._slice_temporal_model_inputs(forward_kwargs, 0, scale_frames, batch_size=1)
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
             model.forward(
                 warm_scale,
                 num_frame_for_scale=scale_frames,
                 num_frame_per_block=scale_frames,
                 causal_inference=True,
+                **scale_kwargs,
             )
         for i in range(warm_stream_n):
             torch.compiler.cudagraph_mark_step_begin()
+            frame_kwargs = model._slice_temporal_model_inputs(
+                forward_kwargs,
+                scale_frames + i,
+                scale_frames + i + 1,
+                batch_size=1,
+            )
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
                 model.forward(
                     warm_stream[:, i:i + 1],
                     num_frame_for_scale=scale_frames,
                     num_frame_per_block=1,
                     causal_inference=True,
+                    **frame_kwargs,
                 )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -319,6 +350,14 @@ def main():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--image_size", type=int, default=518)
     parser.add_argument("--patch_size", type=int, default=14)
+    parser.add_argument(
+        "--preprocess_mode",
+        type=str,
+        default="crop",
+        choices=["crop", "pad"],
+        help="Image preprocessing mode before patch embedding. "
+             "'crop' matches the original demo behavior; 'pad' preserves the full frame.",
+    )
 
     # Inference mode
     parser.add_argument("--mode", type=str, default="streaming", choices=["streaming", "windowed"],
@@ -341,6 +380,38 @@ def main():
                              "(skips 3 refinement passes at a small accuracy cost).")
     parser.add_argument("--use_sdpa", action="store_true", default=False,
                         help="Use SDPA backend (no flashinfer needed). Default: FlashInfer")
+    parser.add_argument(
+        "--enable_ray_conditioning",
+        action="store_true",
+        help="Enable the experimental patch-ray side channel for projection-aware token conditioning.",
+    )
+    parser.add_argument(
+        "--input_camera_model",
+        type=str,
+        default="pinhole",
+        choices=["pinhole", "perspective", "equirectangular"],
+        help="Camera model passed to the experimental ray-conditioning path.",
+    )
+    parser.add_argument(
+        "--input_intrinsics_file",
+        type=str,
+        default=None,
+        help="Optional intrinsics file in original-image pixel coordinates. "
+             "Supported formats: .npy, .npz, .json, .pt/.pth.",
+    )
+    parser.add_argument(
+        "--ray_use_default_intrinsics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When ray conditioning uses a pinhole camera without explicit intrinsics, fall back to pseudo intrinsics.",
+    )
+    parser.add_argument(
+        "--ray_conditioning_gate_value",
+        type=float,
+        default=None,
+        help="Diagnostic override for the ray-conditioning gate. "
+             "Useful before finetuning; default keeps the zero-init gate from the checkpoint/model.",
+    )
     parser.add_argument("--compile", action="store_true", default=False,
                         help="torch.compile hot modules (reduce-overhead) with a CUDA-graph warmup. "
                              "Streaming mode only; ~5 FPS faster at 518x378. Adds ~30-60 s warmup time.")
@@ -381,6 +452,7 @@ def main():
         image_folder=args.image_folder, video_path=args.video_path,
         fps=args.fps, first_k=args.first_k, stride=args.stride,
         image_size=args.image_size, patch_size=args.patch_size,
+        preprocess_mode=args.preprocess_mode,
     )
 
     # Export preprocessed images if requested
@@ -444,6 +516,22 @@ def main():
             f"(after the first {args.num_scale_frames} scale frames)."
         )
 
+    forward_kwargs = {
+        "input_camera_model": args.input_camera_model,
+    }
+    if args.input_intrinsics_file:
+        forward_kwargs["input_intrinsics"] = load_input_intrinsics(
+            paths,
+            args.input_intrinsics_file,
+            image_size=args.image_size,
+            patch_size=args.patch_size,
+            preprocess_mode=args.preprocess_mode,
+        )
+        print(
+            f"Loaded input intrinsics from {args.input_intrinsics_file} "
+            f"with shape {tuple(forward_kwargs['input_intrinsics'].shape)}"
+        )
+
     # ── Optional: torch.compile + CUDA-graph warmup (streaming only) ────────
     if args.compile:
         if args.mode != "streaming":
@@ -456,7 +544,15 @@ def main():
             warm_stream_n = min(10, max(1, num_frames - scale_for_warm))
             print(f"Warmup eager (scale + {warm_stream_n} streaming)...")
             t_warm = time.time()
-            _warm_streaming(model, images, scale_for_warm, warm_stream_n, dtype, passes=1)
+            _warm_streaming(
+                model,
+                images,
+                scale_for_warm,
+                warm_stream_n,
+                dtype,
+                passes=1,
+                forward_kwargs=forward_kwargs,
+            )
             print(f"  eager warmup: {time.time() - t_warm:.1f}s")
 
             print("Compiling hot modules...")
@@ -467,7 +563,15 @@ def main():
             # real inference will see. See gct_profile.py:302-306 for rationale.
             print("Warmup compiled (3x dress rehearsal)...")
             t_warm = time.time()
-            _warm_streaming(model, images, scale_for_warm, warm_stream_n, dtype, passes=3)
+            _warm_streaming(
+                model,
+                images,
+                scale_for_warm,
+                warm_stream_n,
+                dtype,
+                passes=3,
+                forward_kwargs=forward_kwargs,
+            )
             print(f"  compiled warmup: {time.time() - t_warm:.1f}s")
 
     # ── Inference ────────────────────────────────────────────────────────────
@@ -483,6 +587,7 @@ def main():
                 num_scale_frames=args.num_scale_frames,
                 keyframe_interval=args.keyframe_interval,
                 output_device=output_device,
+                **forward_kwargs,
             )
         else:  # windowed
             predictions = model.inference_windowed(
@@ -491,6 +596,7 @@ def main():
                 overlap_size=args.overlap_size,
                 num_scale_frames=args.num_scale_frames,
                 output_device=output_device,
+                **forward_kwargs,
             )
 
     print(f"Inference done in {time.time() - t0:.1f}s")

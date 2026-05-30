@@ -1,0 +1,90 @@
+{
+  "history": [
+    {
+      "depth": 1.867657010734547e-05,
+      "depth_conf": 0.0031729729380458593,
+      "end_idx": 6,
+      "gate_mean": 0.00106048583984375,
+      "pose_fov": 1.0900465241547863e-07,
+      "pose_xyz_quat": 5.016368209709299e-09,
+      "start_idx": 2,
+      "step": 1,
+      "total": 0.00017734113498590887
+    },
+    {
+      "depth": 1.9413570043980144e-05,
+      "depth_conf": 0.023500043898820877,
+      "end_idx": 6,
+      "gate_mean": 0.00103759765625,
+      "pose_fov": 5.6148984128867596e-08,
+      "pose_xyz_quat": 5.34314237299327e-09,
+      "start_idx": 2,
+      "step": 2,
+      "total": 0.001194426673464477
+    },
+    {
+      "depth": 1.702813278825488e-05,
+      "depth_conf": 0.016023539006710052,
+      "end_idx": 4,
+      "gate_mean": 0.0010223388671875,
+      "pose_fov": 6.971008303935378e-08,
+      "pose_xyz_quat": 1.8863590689477405e-09,
+      "start_idx": 0,
+      "step": 3,
+      "total": 0.000818213913589716
+    }
+  ],
+  "input": {
+    "num_chunks": 3,
+    "num_frames": 8,
+    "resolved_image_folder": "tmp_frames/video_20260418_1906051_ffmpeg_frames_fps2"
+  },
+  "results": {
+    "best_loss": 0.00017734113498590887,
+    "checkpoint_path": "research_eval/ray_bootstrap/jitter_smoke_2026-05-30/ray_conditioning_bootstrap_best.pt",
+    "elapsed_sec": 26.786524772644043,
+    "final_gate_mean": 0.0010223388671875,
+    "final_loss": 0.000818213913589716,
+    "peak_gpu_allocated_gb": 9.062005248
+  },
+  "settings": {
+    "camera_num_iterations": 4,
+    "enable_3d_rope": true,
+    "eval_every": 1,
+    "first_k": 8,
+    "fps": 10,
+    "grad_clip_norm": 1.0,
+    "image_folder": "tmp_frames/video_20260418_1906051_ffmpeg_frames_fps2",
+    "image_size": 518,
+    "kv_cache_sliding_window": 64,
+    "loss_w_depth": 1.0,
+    "loss_w_depth_conf": 0.05,
+    "loss_w_fov": 0.1,
+    "loss_w_pose": 1.0,
+    "lr": 0.002,
+    "max_frame_num": 1024,
+    "max_steps": 3,
+    "model_path": "checkpoints/lingbot-map.pt",
+    "num_scale_frames": 8,
+    "offload_teacher_to_cpu": true,
+    "output_dir": "research_eval/ray_bootstrap/jitter_smoke_2026-05-30",
+    "patch_size": 14,
+    "preprocess_mode": "crop",
+    "ray_gate_init": 0.001,
+    "seed": 0,
+    "sequence_length": 4,
+    "sequence_stride": 2,
+    "stride": 1,
+    "student_dtype": "torch.bfloat16",
+    "student_focal_jitter_pct": 0.05,
+    "student_input_camera_model": "pinhole",
+    "student_input_intrinsics_file": "research_eval/camera_inputs/video_20260418_pseudo_intrinsics_1920x1080.json",
+    "student_principal_point_jitter_px": 8.0,
+    "teacher_dtype": "torch.bfloat16",
+    "teacher_input_camera_model": "pinhole",
+    "teacher_input_intrinsics_file": null,
+    "use_sdpa": true,
+    "video_path": null,
+    "weight_decay": 0.0001
+  }
+}

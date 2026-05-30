@@ -1,0 +1,68 @@
+{
+  "gpu": {
+    "cuda_available": true,
+    "max_memory_allocated_gb": 6.031936512,
+    "max_memory_reserved_gb": 13.776191488
+  },
+  "input": {
+    "first_k": 24,
+    "fps": 10,
+    "image_folder": "tmp_frames/video_20260418_1906051_ffmpeg_frames_fps2",
+    "num_frames_after_sampling": 24,
+    "num_input_paths": 24,
+    "resolved_image_folder": "tmp_frames/video_20260418_1906051_ffmpeg_frames_fps2",
+    "stride": 1,
+    "video_path": null
+  },
+  "prediction_keys": [
+    "depth",
+    "depth_conf",
+    "extrinsic",
+    "intrinsic",
+    "pose_enc"
+  ],
+  "proxy_metrics": {
+    "depth_conf_frame_mean_std": 0.3176870346069336,
+    "depth_conf_mean": 3.0717859268188477,
+    "depth_conf_std": 2.619436740875244,
+    "depth_mean": 1.0176032781600952,
+    "depth_p95": 2.77408572435379,
+    "depth_std": 0.9471622109413147,
+    "step_rotation_deg_max": 1.6860920190811157,
+    "step_rotation_deg_mean": 0.5712909698486328,
+    "step_rotation_deg_std": 0.38045981526374817,
+    "step_translation_max": 0.0280451662838459,
+    "step_translation_mean": 0.02032356522977352,
+    "step_translation_std": 0.0041383616626262665,
+    "translation_norm_mean": 0.22835099697113037,
+    "translation_norm_std": 0.13434390723705292,
+    "valid_depth_ratio_mean": 1.0,
+    "valid_depth_ratio_std": 0.0
+  },
+  "settings": {
+    "camera_num_iterations": 4,
+    "dtype": "torch.bfloat16",
+    "enable_ray_conditioning": true,
+    "image_size": 518,
+    "input_camera_model": "equirectangular",
+    "input_intrinsics_file": null,
+    "keyframe_interval": 1,
+    "mode": "streaming",
+    "num_scale_frames": 8,
+    "offload_to_cpu": true,
+    "overlap_size": 16,
+    "patch_size": 14,
+    "preprocess_mode": "crop",
+    "ray_conditioning_gate_value": 0.1,
+    "ray_use_default_intrinsics": true,
+    "use_sdpa": true,
+    "window_size": 64
+  },
+  "tag": "video_fps2_24_equirectangular_gate01",
+  "timing": {
+    "frames_per_sec_inference": 5.943966867455473,
+    "inference_time_sec": 4.037707567214966,
+    "load_time_sec": 7.027621269226074,
+    "postprocess_time_sec": 0.0005216598510742188
+  }
+}

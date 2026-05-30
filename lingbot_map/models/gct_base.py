@@ -139,6 +139,53 @@ class GCTBase(nn.Module, PyTorchModelHubMixin, ABC):
             query_points = query_points.unsqueeze(0)
         return images, query_points
 
+    def _slice_temporal_model_inputs(
+        self,
+        model_inputs: Dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+        batch_size: int,
+    ) -> Dict[str, Any]:
+        """Slice sequence-conditioned auxiliary inputs to a frame interval."""
+        sliced = dict(model_inputs)
+
+        intrinsics = sliced.get("input_intrinsics")
+        if intrinsics is not None:
+            if torch.is_tensor(intrinsics):
+                if intrinsics.ndim == 3:
+                    sliced["input_intrinsics"] = intrinsics[start_idx:end_idx]
+                elif intrinsics.ndim == 4 and intrinsics.shape[0] == batch_size:
+                    sliced["input_intrinsics"] = intrinsics[:, start_idx:end_idx]
+            elif isinstance(intrinsics, np.ndarray):
+                if intrinsics.ndim == 3:
+                    sliced["input_intrinsics"] = intrinsics[start_idx:end_idx]
+                elif intrinsics.ndim == 4 and intrinsics.shape[0] == batch_size:
+                    sliced["input_intrinsics"] = intrinsics[:, start_idx:end_idx]
+
+        patch_rays = sliced.get("input_patch_rays")
+        if patch_rays is not None:
+            if torch.is_tensor(patch_rays):
+                if patch_rays.ndim == 4:
+                    sliced["input_patch_rays"] = patch_rays[start_idx:end_idx]
+                elif patch_rays.ndim == 5 and patch_rays.shape[0] == batch_size:
+                    sliced["input_patch_rays"] = patch_rays[:, start_idx:end_idx]
+            elif isinstance(patch_rays, np.ndarray):
+                if patch_rays.ndim == 4:
+                    sliced["input_patch_rays"] = patch_rays[start_idx:end_idx]
+                elif patch_rays.ndim == 5 and patch_rays.shape[0] == batch_size:
+                    sliced["input_patch_rays"] = patch_rays[:, start_idx:end_idx]
+
+        camera_model = sliced.get("input_camera_model")
+        if isinstance(camera_model, (list, tuple)):
+            if len(camera_model) == batch_size and batch_size > 1 and all(
+                isinstance(item, (list, tuple)) for item in camera_model
+            ):
+                sliced["input_camera_model"] = [item[start_idx:end_idx] for item in camera_model]
+            elif len(camera_model) >= end_idx and all(isinstance(item, str) for item in camera_model):
+                sliced["input_camera_model"] = list(camera_model[start_idx:end_idx])
+
+        return sliced
+
     @abstractmethod
     def _aggregate_features(
         self,
@@ -150,6 +197,7 @@ class GCTBase(nn.Module, PyTorchModelHubMixin, ABC):
         causal_graphs: Optional[Union[torch.Tensor, List[np.ndarray]]] = None,
         ordered_video: Optional[torch.Tensor] = None,
         is_cp_sliced: bool = False,
+        **kwargs,
     ) -> tuple:
         pass
 
@@ -324,6 +372,7 @@ class GCTBase(nn.Module, PyTorchModelHubMixin, ABC):
             num_frame_for_scale=num_frame_for_scale,
             sliding_window_size=sliding_window_size,
             num_frame_per_block=num_frame_per_block,
+            **kwargs,
         )
 
         predictions = {}

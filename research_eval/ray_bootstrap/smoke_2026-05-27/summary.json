@@ -1,0 +1,77 @@
+{
+  "history": [
+    {
+      "depth": 1.3083502381050494e-05,
+      "depth_conf": 0.004707701038569212,
+      "end_idx": 6,
+      "gate_mean": 0.000965118408203125,
+      "pose_fov": 5.4069747790208567e-08,
+      "pose_xyz_quat": 5.2284270246616416e-09,
+      "start_idx": 2,
+      "step": 1,
+      "total": 0.0002484791912138462
+    },
+    {
+      "depth": 2.4086162738967687e-05,
+      "depth_conf": 0.031174467876553535,
+      "end_idx": 6,
+      "gate_mean": 0.000949859619140625,
+      "pose_fov": 4.8969006627430645e-08,
+      "pose_xyz_quat": 1.8089852948932617e-09,
+      "start_idx": 2,
+      "step": 2,
+      "total": 0.001582816243171692
+    }
+  ],
+  "input": {
+    "num_chunks": 3,
+    "num_frames": 8,
+    "resolved_image_folder": "tmp_frames/video_20260418_1906051_ffmpeg_frames_fps2"
+  },
+  "results": {
+    "best_loss": 0.0002484791912138462,
+    "checkpoint_path": "research_eval/ray_bootstrap/smoke_2026-05-27/ray_conditioning_bootstrap_best.pt",
+    "elapsed_sec": 24.575494289398193,
+    "final_gate_mean": 0.000949859619140625,
+    "final_loss": 0.001582816243171692,
+    "peak_gpu_allocated_gb": 9.061960192
+  },
+  "settings": {
+    "camera_num_iterations": 4,
+    "enable_3d_rope": true,
+    "eval_every": 1,
+    "first_k": 8,
+    "fps": 10,
+    "grad_clip_norm": 1.0,
+    "image_folder": "tmp_frames/video_20260418_1906051_ffmpeg_frames_fps2",
+    "image_size": 518,
+    "kv_cache_sliding_window": 64,
+    "loss_w_depth": 1.0,
+    "loss_w_depth_conf": 0.05,
+    "loss_w_fov": 0.1,
+    "loss_w_pose": 1.0,
+    "lr": 0.002,
+    "max_frame_num": 1024,
+    "max_steps": 2,
+    "model_path": "checkpoints/lingbot-map.pt",
+    "num_scale_frames": 8,
+    "offload_teacher_to_cpu": true,
+    "output_dir": "research_eval/ray_bootstrap/smoke_2026-05-27",
+    "patch_size": 14,
+    "preprocess_mode": "crop",
+    "ray_gate_init": 0.001,
+    "seed": 0,
+    "sequence_length": 4,
+    "sequence_stride": 2,
+    "stride": 1,
+    "student_dtype": "torch.bfloat16",
+    "student_input_camera_model": "pinhole",
+    "student_input_intrinsics_file": "research_eval/camera_inputs/video_20260418_pseudo_intrinsics_1920x1080.json",
+    "teacher_dtype": "torch.bfloat16",
+    "teacher_input_camera_model": "pinhole",
+    "teacher_input_intrinsics_file": null,
+    "use_sdpa": true,
+    "video_path": null,
+    "weight_decay": 0.0001
+  }
+}

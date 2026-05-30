@@ -1,0 +1,62 @@
+{
+  "gpu": {
+    "cuda_available": true,
+    "max_memory_allocated_gb": 6.020909056,
+    "max_memory_reserved_gb": 13.178503168
+  },
+  "input": {
+    "first_k": null,
+    "fps": 10,
+    "image_folder": "/media/slam/My Passport/lingbot-map/research_eval/viewpoint_break/control_vs_drop_24/prepared_control_24",
+    "num_frames_after_sampling": 24,
+    "num_input_paths": 24,
+    "resolved_image_folder": "/media/slam/My Passport/lingbot-map/research_eval/viewpoint_break/control_vs_drop_24/prepared_control_24",
+    "stride": 1,
+    "video_path": null
+  },
+  "prediction_keys": [
+    "depth",
+    "depth_conf",
+    "extrinsic",
+    "intrinsic",
+    "pose_enc"
+  ],
+  "proxy_metrics": {
+    "depth_conf_frame_mean_std": 0.19736449420452118,
+    "depth_conf_mean": 2.5087335109710693,
+    "depth_conf_std": 1.916304588317871,
+    "depth_mean": 1.077359914779663,
+    "depth_p95": 3.009545087814331,
+    "depth_std": 1.0036121606826782,
+    "step_rotation_deg_max": 1.804067850112915,
+    "step_rotation_deg_mean": 0.5922184586524963,
+    "step_rotation_deg_std": 0.400486558675766,
+    "step_translation_max": 0.027279894798994064,
+    "step_translation_mean": 0.02159220166504383,
+    "step_translation_std": 0.003515149699524045,
+    "translation_norm_mean": 0.24162228405475616,
+    "translation_norm_std": 0.14302527904510498,
+    "valid_depth_ratio_mean": 1.0,
+    "valid_depth_ratio_std": 0.0
+  },
+  "settings": {
+    "camera_num_iterations": 1,
+    "dtype": "torch.bfloat16",
+    "image_size": 518,
+    "keyframe_interval": 1,
+    "mode": "streaming",
+    "num_scale_frames": 2,
+    "offload_to_cpu": true,
+    "overlap_size": 16,
+    "patch_size": 14,
+    "use_sdpa": true,
+    "window_size": 64
+  },
+  "tag": "control_24",
+  "timing": {
+    "frames_per_sec_inference": 6.066162515524975,
+    "inference_time_sec": 3.9563727378845215,
+    "load_time_sec": 6.725020170211792,
+    "postprocess_time_sec": 0.0005800724029541016
+  }
+}

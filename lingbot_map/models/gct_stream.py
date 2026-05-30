@@ -77,6 +77,9 @@ class GCTStream(GCTBase):
         use_gradient_checkpoint: bool = True,
         # Camera head iterative refinement (lower = faster inference; default 4)
         camera_num_iterations: int = 4,
+        # Projection-aware token side channel
+        enable_ray_conditioning: bool = False,
+        ray_conditioning_use_default_intrinsics: bool = True,
     ):
         """
         Initialize GCTStream.
@@ -126,6 +129,8 @@ class GCTStream(GCTBase):
         self.kv_cache_camera_only = kv_cache_camera_only
         self.use_sdpa = use_sdpa
         self.camera_num_iterations = camera_num_iterations
+        self.enable_ray_conditioning = enable_ray_conditioning
+        self.ray_conditioning_use_default_intrinsics = ray_conditioning_use_default_intrinsics
 
         # Call base class __init__ (will call _build_aggregator)
         super().__init__(
@@ -176,6 +181,8 @@ class GCTStream(GCTBase):
             kv_cache_include_scale_frames=self.kv_cache_include_scale_frames,
             kv_cache_camera_only=self.kv_cache_camera_only,
             use_gradient_checkpoint=self.use_gradient_checkpoint,
+            enable_ray_conditioning=self.enable_ray_conditioning,
+            ray_conditioning_use_default_intrinsics=self.ray_conditioning_use_default_intrinsics,
         )
 
     def _build_camera_head(self) -> nn.Module:
@@ -228,6 +235,7 @@ class GCTStream(GCTBase):
             num_frame_for_scale=num_frame_for_scale,
             sliding_window_size=sliding_window_size,
             num_frame_per_block=num_frame_per_block,
+            **kwargs,
         )
         return aggregated_tokens_list, patch_start_idx
 
@@ -299,6 +307,7 @@ class GCTStream(GCTBase):
         num_scale_frames: Optional[int] = None,
         keyframe_interval: int = 1,
         output_device: Optional[torch.device] = None,
+        **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Streaming inference: process scale frames first, then frame-by-frame.
@@ -356,11 +365,13 @@ class GCTStream(GCTBase):
         # These frames get bidirectional attention among themselves via scale token
         logger.info(f'Processing {scale_frames} scale frames...')
         scale_images = images[:, :scale_frames]
+        scale_kwargs = self._slice_temporal_model_inputs(kwargs, 0, scale_frames, batch_size=B)
         scale_output = self.forward(
             scale_images,
             num_frame_for_scale=scale_frames,
             num_frame_per_block=scale_frames,  # Process all scale frames as one block
             causal_inference=True,
+            **scale_kwargs,
         )
 
         # Initialize output lists with scale frame predictions (offload if needed)
@@ -380,6 +391,7 @@ class GCTStream(GCTBase):
         )
         for i in pbar:
             frame_image = images[:, i:i+1]
+            frame_kwargs = self._slice_temporal_model_inputs(kwargs, i, i + 1, batch_size=B)
 
             # Determine if this frame is a keyframe
             is_keyframe = (keyframe_interval <= 1) or ((i - scale_frames) % keyframe_interval == 0)
@@ -392,6 +404,7 @@ class GCTStream(GCTBase):
                 num_frame_for_scale=scale_frames,  # Keep same for scale token logic
                 num_frame_per_block=1,  # Single frame per block
                 causal_inference=True,
+                **frame_kwargs,
             )
 
             if not is_keyframe:

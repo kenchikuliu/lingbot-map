@@ -14,12 +14,13 @@ import logging
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple, List
+from typing import Any, Optional, Tuple, List
 
 from lingbot_map.layers import PatchEmbed
 from lingbot_map.layers.block import Block
 from lingbot_map.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from lingbot_map.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from lingbot_map.utils.rays import build_camera_rays, patchify_rays
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,9 @@ class AggregatorBase(nn.Module, ABC):
         # Gradient checkpointing
         use_reentrant: bool = False,
         use_gradient_checkpoint: bool = True,
+        # Optional camera-ray side channel
+        enable_ray_conditioning: bool = False,
+        ray_conditioning_use_default_intrinsics: bool = True,
     ):
         super().__init__()
 
@@ -119,6 +123,8 @@ class AggregatorBase(nn.Module, ABC):
         self.use_gradient_checkpoint = use_gradient_checkpoint
         self.pretrained_path = pretrained_path
         self.enable_ulysses_cp = False  # CP disabled
+        self.enable_ray_conditioning = enable_ray_conditioning
+        self.ray_conditioning_use_default_intrinsics = ray_conditioning_use_default_intrinsics
 
         # Validate depth
         if self.depth % self.aa_block_size != 0:
@@ -155,6 +161,7 @@ class AggregatorBase(nn.Module, ABC):
 
         # Setup special tokens (camera, register, optionally scale)
         self._setup_special_tokens()
+        self._setup_ray_conditioning()
 
         # Register normalization constants
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
@@ -164,6 +171,21 @@ class AggregatorBase(nn.Module, ABC):
         if hasattr(self, '_dino_checkpoint') and self._dino_checkpoint is not None:
             self._init_blocks_from_dino(self._dino_checkpoint)
             del self._dino_checkpoint  # Free memory
+
+    def _setup_ray_conditioning(self):
+        """Build the optional patch-ray side channel.
+
+        The gate is zero-initialized so existing checkpoints preserve their
+        original behavior even when the module is constructed with the feature
+        enabled.
+        """
+        if not self.enable_ray_conditioning:
+            self.ray_conditioning_proj = None
+            self.ray_conditioning_gate = None
+            return
+
+        self.ray_conditioning_proj = nn.Linear(3, self.embed_dim, bias=False)
+        self.ray_conditioning_gate = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
 
     def _build_patch_embed(
         self,
@@ -338,6 +360,7 @@ class AggregatorBase(nn.Module, ABC):
         self,
         images: torch.Tensor,
         num_frame_for_scale: Optional[int] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, int, int, int, int, int]:
         """
         Embed images and prepare for attention processing.
@@ -383,6 +406,16 @@ class AggregatorBase(nn.Module, ABC):
 
         _, P_patch, C = patch_tokens.shape
 
+        patch_tokens = self._apply_ray_conditioning(
+            patch_tokens,
+            batch_size=B,
+            sequence_length=S,
+            image_height=H,
+            image_width=W,
+            patch_count=P_patch,
+            **kwargs,
+        )
+
         # Prepare special tokens
         special_tokens = self._prepare_special_tokens(
             B, S_local, S_global, C,
@@ -395,6 +428,231 @@ class AggregatorBase(nn.Module, ABC):
         _, P, C = tokens.shape
 
         return tokens, B, S_local, S_global, P, C
+
+    def _default_pinhole_intrinsics(
+        self,
+        batch_size: int,
+        sequence_length: int,
+        image_height: int,
+        image_width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Construct simple pseudo-intrinsics for uncalibrated perspective input."""
+        intrinsics = torch.zeros(batch_size, sequence_length, 3, 3, device=device, dtype=dtype)
+        focal = float(max(image_height, image_width))
+        intrinsics[..., 0, 0] = focal
+        intrinsics[..., 1, 1] = focal
+        intrinsics[..., 0, 2] = image_width * 0.5
+        intrinsics[..., 1, 2] = image_height * 0.5
+        intrinsics[..., 2, 2] = 1.0
+        return intrinsics
+
+    def _normalize_intrinsics(
+        self,
+        intrinsics: Any,
+        batch_size: int,
+        sequence_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Broadcast intrinsics to ``[B, S, 3, 3]``."""
+        intrinsics_t = torch.as_tensor(intrinsics, device=device)
+        if intrinsics_t.shape[-2:] != (3, 3):
+            raise ValueError(f"intrinsics must end with shape (3, 3), got {tuple(intrinsics_t.shape)}")
+
+        intrinsics_t = intrinsics_t.to(dtype=dtype)
+
+        if intrinsics_t.ndim == 2:
+            return intrinsics_t.view(1, 1, 3, 3).expand(batch_size, sequence_length, -1, -1).clone()
+        if intrinsics_t.ndim == 3:
+            if intrinsics_t.shape[0] == sequence_length and batch_size == 1:
+                return intrinsics_t.unsqueeze(0)
+            if intrinsics_t.shape[0] == batch_size:
+                return intrinsics_t[:, None].expand(-1, sequence_length, -1, -1).clone()
+        if intrinsics_t.ndim == 4:
+            if intrinsics_t.shape[:2] == (batch_size, sequence_length):
+                return intrinsics_t
+            if intrinsics_t.shape[0] == batch_size and intrinsics_t.shape[1] == 1:
+                return intrinsics_t.expand(-1, sequence_length, -1, -1).clone()
+
+        raise ValueError(
+            "intrinsics must have shape (3, 3), (S, 3, 3), (B, 3, 3), or (B, S, 3, 3)"
+        )
+
+    def _resolve_camera_model(
+        self,
+        camera_model: Any,
+        batch_idx: int,
+        frame_idx: int,
+        batch_size: int,
+        sequence_length: int,
+    ) -> str:
+        """Resolve a camera-model spec into a per-frame string."""
+        if isinstance(camera_model, str):
+            return camera_model
+        if isinstance(camera_model, (list, tuple)):
+            if len(camera_model) == 1:
+                return self._resolve_camera_model(camera_model[0], batch_idx, frame_idx, batch_size, sequence_length)
+            if len(camera_model) == sequence_length and all(isinstance(item, str) for item in camera_model):
+                return camera_model[frame_idx]
+            if len(camera_model) == batch_size and isinstance(camera_model[batch_idx], (list, tuple)):
+                per_batch = camera_model[batch_idx]
+                if len(per_batch) == sequence_length and all(isinstance(item, str) for item in per_batch):
+                    return per_batch[frame_idx]
+
+        raise ValueError("camera_model must be a string or a per-frame sequence of strings")
+
+    def _normalize_patch_rays(
+        self,
+        patch_rays: Any,
+        batch_size: int,
+        sequence_length: int,
+        image_height: int,
+        image_width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Normalize raw or patch-level rays to ``[B, S, H_patch, W_patch, 3]``."""
+        patch_h = image_height // self.patch_size
+        patch_w = image_width // self.patch_size
+        patch_count = patch_h * patch_w
+
+        rays_t = torch.as_tensor(patch_rays, device=device, dtype=dtype)
+        if rays_t.shape[-1] != 3:
+            raise ValueError(f"patch rays must end with shape (..., 3), got {tuple(rays_t.shape)}")
+
+        if rays_t.ndim == 3:
+            if rays_t.shape[:2] == (image_height, image_width):
+                rays_t = patchify_rays(rays_t, self.patch_size)
+                return rays_t.view(1, 1, patch_h, patch_w, 3).expand(batch_size, sequence_length, -1, -1, -1)
+            if rays_t.shape[0] == patch_count and batch_size == 1 and sequence_length == 1:
+                return rays_t.view(1, 1, patch_h, patch_w, 3)
+            if rays_t.shape[0] == sequence_length and rays_t.shape[1] == patch_count and batch_size == 1:
+                return rays_t.view(1, sequence_length, patch_h, patch_w, 3)
+        elif rays_t.ndim == 4:
+            if rays_t.shape[:2] == (batch_size, sequence_length) and rays_t.shape[2] == patch_count:
+                return rays_t.view(batch_size, sequence_length, patch_h, patch_w, 3)
+            if rays_t.shape[0] == sequence_length and rays_t.shape[1:3] == (image_height, image_width) and batch_size == 1:
+                return patchify_rays(rays_t.unsqueeze(0), self.patch_size)
+            if rays_t.shape[0] == sequence_length and rays_t.shape[1] == patch_count and batch_size == 1:
+                return rays_t.view(1, sequence_length, patch_h, patch_w, 3)
+        elif rays_t.ndim == 5:
+            if rays_t.shape[:2] != (batch_size, sequence_length):
+                raise ValueError(
+                    f"patch rays batch/sequence shape must be {(batch_size, sequence_length)}, got {tuple(rays_t.shape[:2])}"
+                )
+            if rays_t.shape[2:4] == (image_height, image_width):
+                return patchify_rays(rays_t, self.patch_size)
+            if rays_t.shape[2:4] == (patch_h, patch_w):
+                return rays_t
+
+        raise ValueError(
+            "patch rays must be image-level or patch-level with shape "
+            "(H, W, 3), (S, H, W, 3), (B, S, H, W, 3), (P, 3), (S, P, 3), "
+            "or (B, S, P, 3)"
+        )
+
+    def _build_patch_rays(
+        self,
+        batch_size: int,
+        sequence_length: int,
+        image_height: int,
+        image_width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Build per-patch rays for the current input batch."""
+        input_patch_rays = kwargs.get("input_patch_rays")
+        if input_patch_rays is not None:
+            return self._normalize_patch_rays(
+                input_patch_rays,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                image_height=image_height,
+                image_width=image_width,
+                device=device,
+                dtype=dtype,
+            )
+
+        camera_model = kwargs.get("input_camera_model", "pinhole")
+        input_intrinsics = kwargs.get("input_intrinsics")
+        intrinsics_t = None
+        if input_intrinsics is not None:
+            intrinsics_t = self._normalize_intrinsics(
+                input_intrinsics,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                device=device,
+                dtype=dtype,
+            )
+        elif self.ray_conditioning_use_default_intrinsics:
+            intrinsics_t = self._default_pinhole_intrinsics(
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                image_height=image_height,
+                image_width=image_width,
+                device=device,
+                dtype=dtype,
+            )
+
+        frame_patch_rays = []
+        for batch_idx in range(batch_size):
+            cur_batch = []
+            for frame_idx in range(sequence_length):
+                model_name = self._resolve_camera_model(
+                    camera_model,
+                    batch_idx=batch_idx,
+                    frame_idx=frame_idx,
+                    batch_size=batch_size,
+                    sequence_length=sequence_length,
+                )
+                frame_intrinsics = None if intrinsics_t is None else intrinsics_t[batch_idx, frame_idx]
+                if model_name.lower() in {"pinhole", "perspective"} and frame_intrinsics is None:
+                    raise ValueError(
+                        "input_intrinsics are required for pinhole ray conditioning unless "
+                        "ray_conditioning_use_default_intrinsics=True"
+                    )
+                rays = build_camera_rays(
+                    model_name,
+                    height=image_height,
+                    width=image_width,
+                    intrinsics=frame_intrinsics,
+                )
+                cur_batch.append(patchify_rays(rays, self.patch_size))
+            frame_patch_rays.append(torch.stack(cur_batch, dim=0))
+        return torch.stack(frame_patch_rays, dim=0)
+
+    def _apply_ray_conditioning(
+        self,
+        patch_tokens: torch.Tensor,
+        batch_size: int,
+        sequence_length: int,
+        image_height: int,
+        image_width: int,
+        patch_count: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Optionally add projection-aware patch descriptors to image tokens."""
+        if not self.enable_ray_conditioning:
+            return patch_tokens
+
+        patch_rays = self._build_patch_rays(
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            image_height=image_height,
+            image_width=image_width,
+            device=patch_tokens.device,
+            dtype=torch.float32,
+            **kwargs,
+        )
+        proj_dtype = self.ray_conditioning_proj.weight.dtype
+        patch_rays = patch_rays.reshape(batch_size * sequence_length, patch_count, 3).to(dtype=proj_dtype)
+        ray_tokens = self.ray_conditioning_proj(patch_rays)
+        ray_tokens = ray_tokens.to(dtype=patch_tokens.dtype)
+        gate = self.ray_conditioning_gate.to(dtype=patch_tokens.dtype)
+        return patch_tokens + gate * ray_tokens
 
     @abstractmethod
     def _prepare_special_tokens(self, B: int, S_local: int, S_global: int, C: int, **kwargs) -> torch.Tensor:
@@ -547,6 +805,7 @@ class AggregatorBase(nn.Module, ABC):
         num_frame_for_scale: Optional[int] = None,
         sliding_window_size: Optional[int] = None,
         num_frame_per_block: int = 1,
+        **kwargs,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Forward pass.
@@ -569,6 +828,7 @@ class AggregatorBase(nn.Module, ABC):
         tokens, B, S_local, S_global, P, C = self._embed_images(
             images,
             num_frame_for_scale=num_frame_for_scale,
+            **kwargs,
         )
 
         # Get position embeddings
@@ -595,6 +855,7 @@ class AggregatorBase(nn.Module, ABC):
                         num_frame_per_block=num_frame_per_block,
                         image_height=H,
                         image_width=W,
+                        **kwargs,
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")

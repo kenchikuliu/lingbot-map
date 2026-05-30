@@ -1,0 +1,68 @@
+{
+  "gpu": {
+    "cuda_available": true,
+    "max_memory_allocated_gb": 6.034820096,
+    "max_memory_reserved_gb": 12.616466432
+  },
+  "input": {
+    "first_k": 24,
+    "fps": 10,
+    "image_folder": "tmp_frames/video_20260418_1906051_ffmpeg_frames_fps2",
+    "num_frames_after_sampling": 24,
+    "num_input_paths": 24,
+    "resolved_image_folder": "tmp_frames/video_20260418_1906051_ffmpeg_frames_fps2",
+    "stride": 1,
+    "video_path": null
+  },
+  "prediction_keys": [
+    "depth",
+    "depth_conf",
+    "extrinsic",
+    "intrinsic",
+    "pose_enc"
+  ],
+  "proxy_metrics": {
+    "depth_conf_frame_mean_std": 0.32932648062705994,
+    "depth_conf_mean": 3.1707301139831543,
+    "depth_conf_std": 2.7443034648895264,
+    "depth_mean": 1.0046306848526,
+    "depth_p95": 2.807475936412811,
+    "depth_std": 0.954971969127655,
+    "step_rotation_deg_max": 1.7178277969360352,
+    "step_rotation_deg_mean": 0.5754976868629456,
+    "step_rotation_deg_std": 0.38966289162635803,
+    "step_translation_max": 0.027155457064509392,
+    "step_translation_mean": 0.0199237372726202,
+    "step_translation_std": 0.004254241473972797,
+    "translation_norm_mean": 0.22402237355709076,
+    "translation_norm_std": 0.13160093128681183,
+    "valid_depth_ratio_mean": 1.0,
+    "valid_depth_ratio_std": 0.0
+  },
+  "settings": {
+    "camera_num_iterations": 4,
+    "dtype": "torch.bfloat16",
+    "enable_ray_conditioning": true,
+    "image_size": 518,
+    "input_camera_model": "pinhole",
+    "input_intrinsics_file": "research_eval/camera_inputs/video_20260418_pseudo_intrinsics_1920x1080.json",
+    "keyframe_interval": 1,
+    "mode": "streaming",
+    "num_scale_frames": 8,
+    "offload_to_cpu": true,
+    "overlap_size": 16,
+    "patch_size": 14,
+    "preprocess_mode": "crop",
+    "ray_conditioning_gate_value": null,
+    "ray_use_default_intrinsics": true,
+    "use_sdpa": true,
+    "window_size": 64
+  },
+  "tag": "video_fps2_24_post_dualview_2026-05-30",
+  "timing": {
+    "frames_per_sec_inference": 6.034805889264518,
+    "inference_time_sec": 3.9769299030303955,
+    "load_time_sec": 6.523109674453735,
+    "postprocess_time_sec": 0.0005350112915039062
+  }
+}

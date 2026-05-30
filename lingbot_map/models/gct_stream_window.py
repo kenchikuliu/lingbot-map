@@ -168,6 +168,9 @@ class GCTStream(GCTBase):
         use_gradient_checkpoint: bool = True,
         # Camera head iterative refinement (lower = faster inference; default 4)
         camera_num_iterations: int = 4,
+        # Projection-aware token side channel
+        enable_ray_conditioning: bool = False,
+        ray_conditioning_use_default_intrinsics: bool = True,
     ):
         """
         Initialize GCTStream.
@@ -217,6 +220,8 @@ class GCTStream(GCTBase):
         self.kv_cache_camera_only = kv_cache_camera_only
         self.use_sdpa = use_sdpa
         self.camera_num_iterations = camera_num_iterations
+        self.enable_ray_conditioning = enable_ray_conditioning
+        self.ray_conditioning_use_default_intrinsics = ray_conditioning_use_default_intrinsics
 
         # Call base class __init__ (will call _build_aggregator)
         super().__init__(
@@ -267,6 +272,8 @@ class GCTStream(GCTBase):
             kv_cache_include_scale_frames=self.kv_cache_include_scale_frames,
             kv_cache_camera_only=self.kv_cache_camera_only,
             use_gradient_checkpoint=self.use_gradient_checkpoint,
+            enable_ray_conditioning=self.enable_ray_conditioning,
+            ray_conditioning_use_default_intrinsics=self.ray_conditioning_use_default_intrinsics,
         )
 
     def _build_camera_head(self) -> nn.Module:
@@ -319,6 +326,7 @@ class GCTStream(GCTBase):
             num_frame_for_scale=num_frame_for_scale,
             sliding_window_size=sliding_window_size,
             num_frame_per_block=num_frame_per_block,
+            **kwargs,
         )
         return aggregated_tokens_list, patch_start_idx
 
@@ -456,6 +464,7 @@ class GCTStream(GCTBase):
         output_device: Optional[torch.device] = None,
         flow_threshold: float = 0.0,
         max_non_keyframe_gap: int = 30,
+        **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Streaming inference: process scale frames first, then frame-by-frame.
@@ -524,11 +533,13 @@ class GCTStream(GCTBase):
         # These frames get bidirectional attention among themselves via scale token
         logger.info(f'Processing {scale_frames} scale frames...')
         scale_images = images[:, :scale_frames]
+        scale_kwargs = self._slice_temporal_model_inputs(kwargs, 0, scale_frames, batch_size=B)
         scale_output = self.forward(
             scale_images,
             num_frame_for_scale=scale_frames,
             num_frame_per_block=scale_frames,  # Process all scale frames as one block
             causal_inference=True,
+            **scale_kwargs,
         )
 
         # Initialize output lists with scale frame predictions (offload if needed)
@@ -555,6 +566,7 @@ class GCTStream(GCTBase):
         )
         for i in pbar:
             frame_image = images[:, i:i+1]
+            frame_kwargs = self._slice_temporal_model_inputs(kwargs, i, i + 1, batch_size=B)
 
             if use_flow_keyframe:
                 # Flow-based: defer eviction, forward, then decide
@@ -565,6 +577,7 @@ class GCTStream(GCTBase):
                     num_frame_for_scale=scale_frames,
                     num_frame_per_block=1,
                     causal_inference=True,
+                    **frame_kwargs,
                 )
 
                 self._set_defer_eviction(False)
@@ -605,6 +618,7 @@ class GCTStream(GCTBase):
                     num_frame_for_scale=scale_frames,
                     num_frame_per_block=1,
                     causal_inference=True,
+                    **frame_kwargs,
                 )
 
                 if not is_keyframe:
@@ -933,6 +947,7 @@ class GCTStream(GCTBase):
         keyframe_interval: int = 1,
         flow_threshold: float = 0.0,
         max_non_keyframe_gap: int = 30,
+        **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Windowed inference with keyframe detection and cross-window alignment.
@@ -1039,11 +1054,18 @@ class GCTStream(GCTBase):
 
                 # ---------- Phase 1: scale frames ----------
                 scale_images = images[:, cursor:cursor + window_scale]
+                scale_kwargs = self._slice_temporal_model_inputs(
+                    kwargs,
+                    cursor,
+                    cursor + window_scale,
+                    batch_size=B,
+                )
                 scale_out = self.forward(
                     scale_images,
                     num_frame_for_scale=window_scale,
                     num_frame_per_block=window_scale,
                     causal_inference=True,
+                    **scale_kwargs,
                 )
                 w_lists = _new_lists()
                 _collect_frame(scale_out, w_lists)
@@ -1063,6 +1085,7 @@ class GCTStream(GCTBase):
 
                 while cursor < S and kf_count < target_kf:
                     frame_image = images[:, cursor:cursor + 1]
+                    frame_kwargs = self._slice_temporal_model_inputs(kwargs, cursor, cursor + 1, batch_size=B)
 
                     self._set_defer_eviction(True)
                     frame_out = self.forward(
@@ -1070,6 +1093,7 @@ class GCTStream(GCTBase):
                         num_frame_for_scale=window_scale,
                         num_frame_per_block=1,
                         causal_inference=True,
+                        **frame_kwargs,
                     )
                     self._set_defer_eviction(False)
 
@@ -1152,11 +1176,18 @@ class GCTStream(GCTBase):
                 window_scale = min(ws, window_len)
 
                 # ---------- Phase 1: scale frames ----------
+                scale_kwargs = self._slice_temporal_model_inputs(
+                    kwargs,
+                    start,
+                    start + window_scale,
+                    batch_size=B,
+                )
                 scale_out = self.forward(
                     window_images[:, :window_scale],
                     num_frame_for_scale=window_scale,
                     num_frame_per_block=window_scale,
                     causal_inference=True,
+                    **scale_kwargs,
                 )
                 w_lists = _new_lists()
                 _collect_frame(scale_out, w_lists)
@@ -1169,6 +1200,12 @@ class GCTStream(GCTBase):
                         kf_int <= 1
                         or ((i - window_scale) % kf_int == 0)
                     )
+                    frame_kwargs = self._slice_temporal_model_inputs(
+                        kwargs,
+                        start + i,
+                        start + i + 1,
+                        batch_size=B,
+                    )
 
                     if not is_keyframe:
                         self._set_skip_append(True)
@@ -1178,6 +1215,7 @@ class GCTStream(GCTBase):
                         num_frame_for_scale=window_scale,
                         num_frame_per_block=1,
                         causal_inference=True,
+                        **frame_kwargs,
                     )
 
                     if not is_keyframe:
